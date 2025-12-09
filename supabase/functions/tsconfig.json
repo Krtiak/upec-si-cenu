@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noImplicitAny": false,
+    "allowJs": true,
+    "lib": [ "dom", "esnext" ],
+    "target": "esnext",
+    // Tieto dve nastavenia sú dôležité pre správne fungovanie Supabase funkcií s importami:
+    "module": "esnext",
+    "moduleResolution": "node" 
+  },
+  "exclude": [ "node_modules" ],
+  
+  // KĽÚČOVÁ ZMENA: Toto povie TypeScriptu, aby kontroloval všetky .ts súbory 
+  // v akomkoľvek podadresári priečinka functions.
+  "include": [
+    "**/*.ts" 
+  ]
+}

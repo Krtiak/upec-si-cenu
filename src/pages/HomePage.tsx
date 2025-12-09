@@ -14,40 +14,15 @@ export function HomePage() {
   }
 
   const [loading, setLoading] = useState(true);
-  const [selectedSize, setSelectedSize] = useState<string | null>(null);
-  const [isDiameterOpen, setIsDiameterOpen] = useState<boolean>(true);
-  const [isHeightOpen, setIsHeightOpen] = useState<boolean>(false);
-  const [selectedHeight, setSelectedHeight] = useState<string | null>(null);
-  const [diameterPrice, setDiameterPrice] = useState<number | null>(null);
-  const [heightPrice, setHeightPrice] = useState<number | null>(null);
-  const [isInnerCreamOpen, setIsInnerCreamOpen] = useState<boolean>(false);
-  const [isOtherCreamOpen, setIsOtherCreamOpen] = useState<boolean>(false);
-  const [isExtraOpen, setIsExtraOpen] = useState<boolean>(false);
-  const [isFruitOpen, setIsFruitOpen] = useState<boolean>(false);
-  const [isDecorationsOpen, setIsDecorationsOpen] = useState<boolean>(false);
-  const [isLogisticsOpen, setIsLogisticsOpen] = useState<boolean>(false);
-  const [selectedInnerCream, setSelectedInnerCream] = useState<string | null>(null);
-  const [selectedOtherCream, setSelectedOtherCream] = useState<string | null>(null);
-  const [selectedExtra, setSelectedExtra] = useState<string | null>(null);
-  const [selectedFruit, setSelectedFruit] = useState<string | null>(null);
-  const [selectedDecorations, setSelectedDecorations] = useState<string | null>(null);
-  const [selectedLogistics, setSelectedLogistics] = useState<string | null>(null);
-  const [rewardAmount, setRewardAmount] = useState<number>(0);
-  const [isRewardOpen, setIsRewardOpen] = useState<boolean>(false);
   const [isCartOpen, setIsCartOpen] = useState<boolean>(false);
+  const [activeItemId, setActiveItemId] = useState<string | null>(null);
   const [isEmailModalOpen, setIsEmailModalOpen] = useState<boolean>(false);
   // Admin emails loading is paused until notifications are wired
 
   interface CartItem {
     id: string;
-    diameter: string;
-    height: string;
-    innerCream: string;
-    outerCream: string;
-    extra?: string;
-    fruit?: string;
-    decorations?: string;
-    logistics: string;
+    // All selections stored dynamically by section key -> option name
+    dynamicSelections: Record<string, string>;
     reward: number;
     totalPrice: number;
     quantity: number;
@@ -55,43 +30,60 @@ export function HomePage() {
   }
   const [cart, setCart] = useState<CartItem[]>([]);
 
-  // Real data from DB
-  const [diameterOptions, setDiameterOptions] = useState<SectionOption[]>([]);
-  const [heightOptions, setHeightOptions] = useState<SectionOption[]>([]);
-  const [innerCreamOptions, setInnerCreamOptions] = useState<SectionOption[]>([]);
-  const [outerCreamOptions, setOuterCreamOptions] = useState<SectionOption[]>([]);
-  const [extraOptions, setExtraOptions] = useState<SectionOption[]>([]);
-  const [fruitOptions, setFruitOptions] = useState<SectionOption[]>([]);
-  const [decorationsOptions, setDecorationsOptions] = useState<SectionOption[]>([]);
-  const [logisticsOptions, setLogisticsOptions] = useState<SectionOption[]>([]);
-
-  const [innerCreamPrice, setInnerCreamPrice] = useState<number | null>(null);
-  const [outerCreamPrice, setOuterCreamPrice] = useState<number | null>(null);
-  const [extraPrice, setExtraPrice] = useState<number | null>(null);
-  const [fruitPrice, setFruitPrice] = useState<number | null>(null);
-  const [decorationsPrice, setDecorationsPrice] = useState<number | null>(null);
-  const [logisticsPrice, setLogisticsPrice] = useState<number | null>(null);
-  const [sectionMeta, setSectionMeta] = useState<Record<string, string>>({});
+  // State pre dynamické sekcie (nové sekcie pridané v AdminPanel)
+  interface DynamicSectionData {
+    key: string;
+    label: string;
+    options: SectionOption[];
+    description: string;
+    isOpen: boolean;
+    selectedId: string | null;
+    required?: boolean;
+  }
+  const [dynamicSections, setDynamicSections] = useState<DynamicSectionData[]>([]);
+  const [showRequiredHint, setShowRequiredHint] = useState<boolean>(false);
 
   // Vypočet celkovej ceny
-  const totalPrice = 
-    (diameterPrice ?? 0) + 
-    (heightPrice ?? 0) + 
-    (innerCreamPrice ?? 0) + 
-    (outerCreamPrice ?? 0) + 
-    (extraPrice ?? 0) + 
-    (fruitPrice ?? 0) + 
-    (decorationsPrice ?? 0) + 
-    (logisticsPrice ?? 0) + 
-    rewardAmount;
+  // totalPrice (global) no longer used; item totals computed per cart item
 
   useEffect(() => {
     loadAllSections();
     loadAdminEmails();
-  }, []);
 
-  // Helper to format price with default 0.00 € when not selected
-  const fmt = (val: number | null) => `${(val ?? 0).toFixed(2)} €`;
+    // Live updates: subscribe to changes on section_meta and section_options
+    const channel = supabase.channel('sections-live')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'section_meta' }, () => {
+        loadAllSections();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'section_options' }, () => {
+        loadAllSections();
+      })
+      .subscribe();
+
+    // Log visit (fire-and-forget)
+    try {
+      const baseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const endpoint = `${baseUrl}/functions/v1/log-visit`;
+      fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          // Provide authorization to avoid 401 from Edge Function
+          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+        },
+        body: JSON.stringify({
+          path: window.location.pathname,
+          userAgent: navigator.userAgent,
+        })
+      }).catch(() => {});
+    } catch (_) {
+      // silent
+    }
+
+    return () => {
+      try { supabase.removeChannel(channel); } catch {}
+    };
+  }, []);
 
   async function loadAllSections() {
     try {
@@ -105,34 +97,62 @@ export function HomePage() {
 
       const opts = data || [];
 
-      const diameter = opts.filter(o => o.section === 'diameter');
-      const height = opts.filter(o => o.section === 'height');
-      const innerCream = opts.filter(o => o.section === 'inner_cream');
-      const outerCream = opts.filter(o => o.section === 'outer_cream');
-      const extra = opts.filter(o => o.section === 'extra');
-      const fruit = opts.filter(o => o.section === 'fruit');
-      const decorations = opts.filter(o => o.section === 'decorations');
-      const logistics = opts.filter(o => o.section === 'logistics');
-
-      setDiameterOptions(diameter);
-      setHeightOptions(height);
-      setInnerCreamOptions(innerCream);
-      setOuterCreamOptions(outerCream);
-      setExtraOptions(extra);
-      setFruitOptions(fruit);
-      setDecorationsOptions(decorations);
-      setLogisticsOptions(logistics);
-
       // Fetch bottom descriptions from section_meta
-      const { data: meta, error: metaErr } = await supabase
-        .from('section_meta')
-        .select('section, description');
-      if (metaErr) throw metaErr;
-      const metaMap: Record<string, string> = {};
-      (meta || []).forEach((m: any) => {
-        if (m?.section) metaMap[m.section] = m.description || '';
+      let meta: any[] | null = null;
+      let metaErr: any = null;
+      {
+        const tmp = await supabase
+          .from('section_meta')
+          .select('section, description, required');
+        meta = tmp.data as any[] | null;
+        metaErr = tmp.error;
+      }
+      if (metaErr) {
+        const fallback = await supabase
+          .from('section_meta')
+          .select('section, description');
+        if (fallback.error) throw fallback.error;
+        meta = (fallback.data as any[] | null) || [];
+      }
+      const metaRows: Array<{ section: string; description: string; required?: boolean }> = (meta || []) as any;
+      const descMap: Record<string, string> = {};
+      const reqMap: Record<string, boolean> = {};
+      metaRows.forEach(m => {
+        if (m?.section) {
+          descMap[m.section] = m.description || '';
+          reqMap[m.section] = Boolean((m as any).required);
+        }
       });
-      setSectionMeta(metaMap);
+
+      const isPlaceholder = (s: string | undefined | null) => {
+        const t = (s || '').trim().toLowerCase();
+        return !t || t === 'spodny popis sekcie' || t === 'spodný popis sekcie';
+      };
+
+      // Postav VŠETKY dynamické sekcie zo zjednotenia kľúčov (meta + options), VRÁTANE logistics
+      const keysFromMeta = Object.keys(descMap);
+      const keysFromOpts = [...new Set(opts.map(o => o.section))];
+      const unionKeys = Array.from(new Set([...keysFromMeta, ...keysFromOpts]));
+
+      const dynamicSectionsData: DynamicSectionData[] = unionKeys.map(key => {
+        const sectionOpts = opts.filter(o => o.section === key);
+        const defaultLabel = key.split('_').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        const metaDesc = descMap[key];
+        const label = (!isPlaceholder(metaDesc)) ? metaDesc : defaultLabel;
+        return {
+          key,
+          label,
+          options: sectionOpts,
+          description: metaDesc || '',
+          isOpen: true,
+          selectedId: null,
+          required: Boolean(reqMap[key]),
+        };
+      });
+      // Ensure uniqueness and stable sort
+      const uniqByKey = Array.from(new Map(dynamicSectionsData.map(ds => [ds.key, ds])).values());
+      const sorted = uniqByKey.sort((a, b) => a.label.localeCompare(b.label, 'sk', { sensitivity: 'base' }));
+      setDynamicSections(sorted);
     } catch (err) {
       console.error('Chyba pri načítaní sekcií:', err);
     } finally {
@@ -146,105 +166,105 @@ export function HomePage() {
   }
 
   // Selection handlers with price updates
-  function onSelectDiameter(id: string) {
-    setSelectedSize(id);
-    const opt = diameterOptions.find(o => o.id === id);
-    setDiameterPrice(opt?.price ?? null);
-  }
+  // Legacy selection handlers removed; dynamic sections use upsertCartDynamic
 
-  function onSelectHeight(id: string) {
-    setSelectedHeight(id);
-    const opt = heightOptions.find(o => o.id === id);
-    setHeightPrice(opt?.price ?? null);
-  }
-
-  function onSelectOuterCream(id: string) {
-    setSelectedOtherCream(id);
-    const opt = outerCreamOptions.find(o => o.id === id);
-    setOuterCreamPrice(opt?.price ?? null);
-  }
-
-  function onSelectInnerCream(id: string) {
-    setSelectedInnerCream(id);
-    const opt = innerCreamOptions.find(o => o.id === id);
-    setInnerCreamPrice(opt?.price ?? null);
-  }
-
-  function onSelectExtra(id: string) {
-    setSelectedExtra(id);
-    const opt = extraOptions.find(o => o.id === id);
-    setExtraPrice(opt?.price ?? null);
-  }
-
-  function onSelectFruit(id: string) {
-    setSelectedFruit(id);
-    const opt = fruitOptions.find(o => o.id === id);
-    setFruitPrice(opt?.price ?? null);
-  }
-
-  function onSelectDecorations(id: string) {
-    setSelectedDecorations(id);
-    const opt = decorationsOptions.find(o => o.id === id);
-    setDecorationsPrice(opt?.price ?? null);
-  }
-
-  function onSelectLogistics(id: string) {
-    setSelectedLogistics(id);
-    const opt = logisticsOptions.find(o => o.id === id);
-    setLogisticsPrice(opt?.price ?? null);
-  }
-
-  // Selected option objects for display
-  const selectedDiameterObj = diameterOptions.find(o => o.id === selectedSize) || null;
-  const selectedHeightObj = heightOptions.find(o => o.id === selectedHeight) || null;
-  const selectedInnerCreamObj = innerCreamOptions.find(o => o.id === selectedInnerCream) || null;
-  const selectedOuterCreamObj = outerCreamOptions.find(o => o.id === selectedOtherCream) || null;
-  const selectedExtraObj = extraOptions.find(o => o.id === selectedExtra) || null;
-  const selectedFruitObj = fruitOptions.find(o => o.id === selectedFruit) || null;
-  const selectedDecorationsObj = decorationsOptions.find(o => o.id === selectedDecorations) || null;
-  const selectedLogisticsObj = logisticsOptions.find(o => o.id === selectedLogistics) || null;
-
-  const isValid = Boolean(selectedSize && selectedHeight && selectedInnerCream && selectedOtherCream && selectedLogistics);
-
-  function addToCart() {
-    if (!isValid) {
-      alert('Prosím vyplňte všetky povinné polia:\n- Priemer torty\n- Výška torty\n- Vnútorný krém\n- Obterový krém\n- Logistika');
-      return;
+  function onSelectDynamic(key: string, optionId: string) {
+    setDynamicSections(prev =>
+      prev.map(ds => (ds.key === key ? { ...ds, selectedId: optionId } : ds))
+    );
+    setShowRequiredHint(false);
+    const section = dynamicSections.find(ds => ds.key === key);
+    const opt = section?.options.find(o => o.id === optionId);
+    if (opt) {
+      upsertCartDynamic(key, opt.name);
     }
+  }
 
-    const newItem: CartItem = {
-      id: Date.now().toString(),
-      diameter: selectedDiameterObj?.name || '',
-      height: selectedHeightObj?.name || '',
-      innerCream: selectedInnerCreamObj?.name || '',
-      outerCream: selectedOuterCreamObj?.name || '',
-      extra: selectedExtraObj?.name || undefined,
-      fruit: selectedFruitObj?.name || undefined,
-      decorations: selectedDecorationsObj?.name || undefined,
-      logistics: selectedLogisticsObj?.name || '',
-      reward: rewardAmount,
-      totalPrice,
-      quantity: 1,
-      eventName: `Torta #${cart.length + 1}`,
-    };
-    setCart(prev => [...prev, newItem]);
-    setIsCartOpen(true);
+  function computeItemTotal(it: CartItem) {
+    let sum = 0;
+    for (const [secKey, name] of Object.entries(it.dynamicSelections || {})) {
+      const ds = dynamicSections.find(d => d.key === secKey);
+      if (!ds) continue;
+      const opt = ds.options.find(o => o.name === name);
+      sum += opt?.price ?? 0;
+    }
+    return sum + (it.reward || 0);
+  }
+
+  // addCake is no longer used directly; '+ ďalšia torta' starts a fresh item
+
+  function upsertCartDynamic(sectionKey: string, optionName: string) {
+    setCart(prev => {
+      // ensure target item
+      let targetId = activeItemId;
+      if (targetId && !prev.some(it => it.id === targetId)) targetId = null;
+      let next = [...prev];
+      if (!targetId) {
+        const newItem: CartItem = {
+          id: Date.now().toString(),
+          dynamicSelections: {},
+          reward: 0,
+          totalPrice: 0,
+          quantity: 1,
+          eventName: `Torta #${prev.length + 1}`,
+        };
+        next = [...prev, newItem];
+        targetId = newItem.id;
+        setActiveItemId(targetId);
+        setIsCartOpen(true);
+      }
+      next = next.map(it => {
+        if (it.id !== targetId) return it;
+        const copy: CartItem = { ...it };
+        copy.dynamicSelections = { ...(copy.dynamicSelections || {}) };
+        copy.dynamicSelections[sectionKey] = optionName || '';
+        copy.totalPrice = computeItemTotal(copy);
+        return copy;
+      });
+      return next;
+    });
+  }
+
+  function removeDynamicPart(itemId: string, sectionKey: string) {
+    setCart(prev => {
+      const updated = prev.map(it => {
+        if (it.id !== itemId) return it;
+        const copy: CartItem = { ...it };
+        if (copy.dynamicSelections) delete copy.dynamicSelections[sectionKey];
+        copy.totalPrice = computeItemTotal(copy);
+        return copy;
+      });
+      const cleaned = updated.filter(it => {
+        const hasDyn = it.dynamicSelections && Object.values(it.dynamicSelections).some(Boolean);
+        return hasDyn;
+      });
+      if (activeItemId && !cleaned.some(it => it.id === activeItemId)) {
+        setActiveItemId(cleaned.length ? cleaned[0].id : null);
+      }
+      return cleaned;
+    });
+    // Reset UI selection for the removed dynamic section
+    setDynamicSections(prev => prev.map(ds => ds.key === sectionKey ? { ...ds, selectedId: null } : ds));
   }
 
   async function handleCheckoutWithData(name: string, email: string) {
     if (cart.length === 0) return;
+    // Check all required sections for every cake
+    const requiredSections = dynamicSections.filter(ds => ds.required);
+    const missingItems = cart.filter(it =>
+      requiredSections.some(ds => !it.dynamicSelections[ds.key])
+    );
+    if (missingItems.length > 0) {
+      setShowRequiredHint(true);
+      alert('Prosím, vyplňte všetky povinné polia pre každú tortu.');
+      return;
+    }
+
     const total = cart.reduce((sum, it) => sum + (it.totalPrice * it.quantity), 0);
     const items = cart.map((it) => ({
       eventName: it.eventName,
       quantity: it.quantity,
-      diameter: it.diameter,
-      height: it.height,
-      innerCream: it.innerCream,
-      outerCream: it.outerCream,
-      extra: it.extra || null,
-      fruit: it.fruit || null,
-      decorations: it.decorations || null,
-      logistics: it.logistics,
+      selections: it.dynamicSelections,
       reward: it.reward,
       unitPrice: it.totalPrice,
       lineTotal: it.totalPrice * it.quantity,
@@ -301,27 +321,7 @@ export function HomePage() {
     }
   }
 
-  function removeCartItem(id: string) {
-    setCart(prev => prev.filter(item => item.id !== id));
-  }
-
-  function increaseItemQuantity(id: string) {
-    setCart(prev => prev.map(item => 
-      item.id === id ? { ...item, quantity: item.quantity + 1 } : item
-    ));
-  }
-
-  function decreaseItemQuantity(id: string) {
-    setCart(prev => prev.map(item => 
-      item.id === id && item.quantity > 1 ? { ...item, quantity: item.quantity - 1 } : item
-    ));
-  }
-
-  function updateEventName(id: string, name: string) {
-    setCart(prev => prev.map(item => 
-      item.id === id ? { ...item, eventName: name } : item
-    ));
-  }
+  // removed unused cart modification helpers (quantity/name)
 
   async function exportCartToPDF() {
     if (cart.length === 0) {
@@ -407,18 +407,12 @@ export function HomePage() {
 
       let y = 55;
 
-      // Build price lookup maps for per-component pricing
-      const priceBy: Record<string, Map<string, number>> = {
-        diameter: new Map(diameterOptions.map(o => [o.name, o.price])),
-        height: new Map(heightOptions.map(o => [o.name, o.price])),
-        inner_cream: new Map(innerCreamOptions.map(o => [o.name, o.price])),
-        outer_cream: new Map(outerCreamOptions.map(o => [o.name, o.price])),
-        extra: new Map(extraOptions.map(o => [o.name, o.price])),
-        fruit: new Map(fruitOptions.map(o => [o.name, o.price])),
-        decorations: new Map(decorationsOptions.map(o => [o.name, o.price])),
-        logistics: new Map(logisticsOptions.map(o => [o.name, o.price])),
-      };
-      const getP = (section: keyof typeof priceBy, name?: string | null) => (name ? (priceBy[section].get(name) ?? 0) : 0);
+      // Build price lookup maps for per-component pricing (all dynamic)
+      const priceBy: Record<string, Map<string, number>> = {};
+      dynamicSections.forEach(ds => {
+        priceBy[ds.key] = new Map(ds.options.map(o => [o.name, o.price]));
+      });
+      const getP = (section: string, name?: string | null) => (name ? (priceBy[section]?.get(name) ?? 0) : 0);
 
       cart.forEach((item, idx) => {
         if (y > 250) { doc.addPage(); y = 25; }
@@ -428,24 +422,21 @@ export function HomePage() {
         doc.rect(15, y - 8, pageWidth - 30, 14, 'F');
         doc.setTextColor(0, 86, 179);
         doc.setFontSize(13);
-        doc.text(`Torta #${idx + 1} (${item.quantity}x)`, 20, y);
+        doc.text('Tvoja dokonalá torta', 20, y);
         doc.setTextColor(100, 100, 100);
         doc.setFontSize(10);
         doc.text(item.eventName, pageWidth - 20, y, { align: 'right' });
         y += 10;
 
-        // Details with prices per component
-        const details = [
-          { label: 'Priemer:', value: item.diameter, price: getP('diameter', item.diameter) },
-          { label: 'Výška:', value: item.height, price: getP('height', item.height) },
-          { label: 'Vnútorný krém:', value: item.innerCream, price: getP('inner_cream', item.innerCream) },
-          { label: 'Obterový krém:', value: item.outerCream, price: getP('outer_cream', item.outerCream) },
-          item.extra ? { label: 'Extra:', value: item.extra, price: getP('extra', item.extra) } : null,
-          item.fruit ? { label: 'Ovocie:', value: item.fruit, price: getP('fruit', item.fruit) } : null,
-          item.decorations ? { label: 'Dekorácie:', value: item.decorations, price: getP('decorations', item.decorations) } : null,
-          { label: 'Logistika:', value: item.logistics, price: getP('logistics', item.logistics) },
-          item.reward > 0 ? { label: 'Odmena pre tvorcu:', value: '', price: item.reward } : null,
-        ].filter(Boolean) as { label: string; value: string; price: number }[];
+        // Details with prices per component (all dynamic)
+        const details = Object.entries(item.dynamicSelections || {}).map(([secKey, name]) => {
+          const ds = dynamicSections.find(d => d.key === secKey);
+          const label = (ds?.label || secKey.split('_').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')) + ':';
+          return { label, value: name, price: getP(secKey, name) };
+        });
+        if (item.reward > 0) {
+          details.push({ label: 'Odmena pre tvorcu:', value: '', price: item.reward });
+        }
 
         doc.setFontSize(9);
         doc.setTextColor(50, 50, 50);
@@ -503,24 +494,7 @@ export function HomePage() {
     }
   }
 
-
-  // Auto-close breakdown when no items selected
-  const hasAnySelected = Boolean(
-    selectedDiameterObj ||
-    selectedHeightObj ||
-    selectedInnerCreamObj ||
-    selectedOuterCreamObj ||
-    selectedExtraObj ||
-    selectedFruitObj ||
-    selectedDecorationsObj ||
-    selectedLogisticsObj
-  );
-
-  useEffect(() => {
-    if (!hasAnySelected && isRewardOpen) {
-      setIsRewardOpen(false);
-    }
-  }, [hasAnySelected]);
+  
 
   // duplicates removed
 
@@ -543,532 +517,178 @@ export function HomePage() {
       </header>
 
       <div style={styles.content} className="content">
-          {/* Diameter section */}
-          <section style={styles.section} className="section-card">
-            <h2 style={styles.sectionTitle}>Priemer torty</h2>
-            <div style={styles.sectionHeaderRow} className="section-row">
-              <div style={styles.centerGroup} className="center-group">
-                {loading ? (
-                  <div style={{ minWidth: 200 }}>Načítavam...</div>
-                ) : (
-                  <select
-                    value={selectedSize ?? ''}
-                    onChange={(e) => onSelectDiameter(e.target.value)}
-                    style={styles.select}
-                  >
-                    <option value="" disabled hidden>Vyberte priemer</option>
-                    {diameterOptions.map((opt) => (
-                      <option key={opt.id} value={opt.id}>{opt.name}</option>
-                    ))}
-                  </select>
-                )}
-                <div style={styles.priceBox}>{fmt(diameterPrice)}</div>
+          {loading && (
+            <div style={{ minWidth: 200, marginBottom: '0.5rem' }}>Načítavam dáta…</div>
+          )}
+          {/* Dynamické sekcie (všetky sekcie z DB) */}
+          {dynamicSections.map((dynSec) => (
+            <section key={dynSec.key} style={styles.section}>
+              <div style={styles.sectionTitleRow}>
+                <h2 style={styles.sectionTitle}>{dynSec.label}{dynSec.required ? ' *' : ''}</h2>
                 <button
                   className="toggle-btn"
-                  aria-expanded={isDiameterOpen}
-                  onClick={() => setIsDiameterOpen((v) => !v)}
-                  style={{ transform: isDiameterOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}
-                  title={isDiameterOpen ? 'Skryť detaily' : 'Zobraziť detaily'}
+                  aria-expanded={dynSec.isOpen}
+                  onClick={() => {
+                    setDynamicSections(prev => prev.map(ds => 
+                      ds.key === dynSec.key ? { ...ds, isOpen: !ds.isOpen } : ds
+                    ));
+                  }}
+                  style={{ ...styles.toggleButton, transform: dynSec.isOpen ? 'rotate(0deg)' : 'rotate(180deg)' }}
+                  title={dynSec.isOpen ? 'Skryť sekciu' : 'Zobraziť sekciu'}
                 >
                   ▾
                 </button>
               </div>
-            </div>
-
-            {isDiameterOpen && (
-              <div style={styles.detailBubble}>
-                <div style={styles.detailBubbleText}>{sectionMeta['diameter'] || 'Popis priemeru'}</div>
-              </div>
-            )}
-          </section>
-
-          {/* Height section */}
-          <section style={styles.section} className="section-card">
-            <h2 style={styles.sectionTitle}>Výška torty</h2>
-            <div style={styles.sectionHeaderRow} className="section-row">
-              <div style={styles.centerGroup} className="center-group">
-                <select
-                  value={selectedHeight ?? ''}
-                  onChange={(e) => onSelectHeight(e.target.value)}
-                  style={styles.select}
-                >
-                  <option value="" disabled hidden>Vyberte výšku</option>
-                  {heightOptions.map((opt) => (
-                    <option key={opt.id} value={opt.id}>{opt.name}</option>
-                  ))}
-                </select>
-
-                <div style={styles.priceBox}>{fmt(heightPrice)}</div>
-
-                <button
-                  className="toggle-btn"
-                  aria-expanded={isHeightOpen}
-                  onClick={() => setIsHeightOpen((v) => !v)}
-                  style={{ transform: isHeightOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}
-                  title={isHeightOpen ? 'Skryť detaily' : 'Zobraziť detaily'}
-                >
-                  ▾
-                </button>
-              </div>
-            </div>
-
-            {isHeightOpen && (
-              <div style={styles.detailBubble}>
-                <div style={styles.detailBubbleText}>{sectionMeta['height'] || 'Popis výšky'}</div>
-              </div>
-            )}
-          </section>
-
-          {/* Inner Cream section */}
-          <section style={styles.section} className="section-card">
-            <h2 style={styles.sectionTitle}>Vnútorný krém</h2>
-            <div style={styles.sectionHeaderRow} className="section-row">
-              <div style={styles.centerGroup} className="center-group">
-                <select
-                  value={selectedInnerCream ?? ''}
-                  onChange={(e) => onSelectInnerCream(e.target.value)}
-                  style={styles.select}
-                >
-                  <option value="" disabled hidden>Vyberte možnosť</option>
-                  {innerCreamOptions.map((opt) => (
-                    <option key={opt.id} value={opt.id}>{opt.name}</option>
-                  ))}
-                </select>
-
-                <div style={styles.priceBox}>{fmt(innerCreamPrice)}</div>
-
-                <button
-                  className="toggle-btn"
-                  aria-expanded={isInnerCreamOpen}
-                  onClick={() => setIsInnerCreamOpen((v) => !v)}
-                  style={{ transform: isInnerCreamOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}
-                  title={isInnerCreamOpen ? 'Skryť detaily' : 'Zobraziť detaily'}
-                >
-                  ▾
-                </button>
-              </div>
-            </div>
-
-            {isInnerCreamOpen && (
-              <div style={styles.detailBubble}>
-                <div style={styles.detailBubbleText}>{sectionMeta['inner_cream'] || 'Popis vnútorného krému'}</div>
-              </div>
-            )}
-          </section>
-
-          {/* Outer Cream section */}
-          <section style={styles.section} className="section-card">
-            <h2 style={styles.sectionTitle}>Obterový krém</h2>
-            <div style={styles.sectionHeaderRow} className="section-row">
-              <div style={styles.centerGroup} className="center-group">
-                <select
-                  value={selectedOtherCream ?? ''}
-                  onChange={(e) => onSelectOuterCream(e.target.value)}
-                  style={styles.select}
-                >
-                  <option value="" disabled hidden>Vyberte možnosť</option>
-                  {outerCreamOptions.map((opt) => (
-                    <option key={opt.id} value={opt.id}>{opt.name}</option>
-                  ))}
-                </select>
-
-                <div style={styles.priceBox}>{fmt(outerCreamPrice)}</div>
-
-                <button
-                  className="toggle-btn"
-                  aria-expanded={isOtherCreamOpen}
-                  onClick={() => setIsOtherCreamOpen((v) => !v)}
-                  style={{ transform: isOtherCreamOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}
-                  title={isOtherCreamOpen ? 'Skryť detaily' : 'Zobraziť detaily'}
-                >
-                  ▾
-                </button>
-              </div>
-            </div>
-
-            {isOtherCreamOpen && (
-              <div style={styles.detailBubble}>
-                <div style={styles.detailBubbleText}>{sectionMeta['outer_cream'] || 'Popis obterového krému'}</div>
-              </div>
-            )}
-          </section>
-
-          {/* Extra section */}
-          <section style={styles.section} className="section-card">
-            <h2 style={styles.sectionTitle}>Extra zložka</h2>
-            <div style={styles.sectionHeaderRow} className="section-row">
-              <div style={styles.centerGroup} className="center-group">
-                <select
-                  value={selectedExtra ?? ''}
-                  onChange={(e) => onSelectExtra(e.target.value)}
-                  style={styles.select}
-                >
-                  <option value="" disabled hidden>Vyberte možnosť</option>
-                  {extraOptions.map((opt) => (
-                    <option key={opt.id} value={opt.id}>{opt.name}</option>
-                  ))}
-                </select>
-
-                <div style={styles.priceBox}>{fmt(extraPrice)}</div>
-
-                <button
-                  className="toggle-btn"
-                  aria-expanded={isExtraOpen}
-                  onClick={() => setIsExtraOpen((v) => !v)}
-                  style={{ transform: isExtraOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}
-                  title={isExtraOpen ? 'Skryť detaily' : 'Zobraziť detaily'}
-                >
-                  ▾
-                </button>
-              </div>
-            </div>
-
-            {isExtraOpen && (
-              <div style={styles.detailBubble}>
-                <div style={styles.detailBubbleText}>{sectionMeta['extra'] || 'Popis extra zložky'}</div>
-              </div>
-            )}
-          </section>
-
-          {/* Fruit section */}
-          <section style={styles.section} className="section-card">
-            <h2 style={styles.sectionTitle}>Ovocie</h2>
-            <div style={styles.sectionHeaderRow} className="section-row">
-              <div style={styles.centerGroup} className="center-group">
-                <select
-                  value={selectedFruit ?? ''}
-                  onChange={(e) => onSelectFruit(e.target.value)}
-                  style={styles.select}
-                >
-                  <option value="" disabled hidden>Vyberte možnosť</option>
-                  {fruitOptions.map((opt) => (
-                    <option key={opt.id} value={opt.id}>{opt.name}</option>
-                  ))}
-                </select>
-
-                <div style={styles.priceBox}>{fmt(fruitPrice)}</div>
-
-                <button
-                  className="toggle-btn"
-                  aria-expanded={isFruitOpen}
-                  onClick={() => setIsFruitOpen((v) => !v)}
-                  style={{ transform: isFruitOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}
-                  title={isFruitOpen ? 'Skryť detaily' : 'Zobraziť detaily'}
-                >
-                  ▾
-                </button>
-              </div>
-            </div>
-
-            {isFruitOpen && (
-              <div style={styles.detailBubble}>
-                <div style={styles.detailBubbleText}>{sectionMeta['fruit'] || 'Popis ovocia'}</div>
-              </div>
-            )}
-          </section>
-
-          {/* Dekorácie section */}
-          <section style={styles.section} className="section-card">
-            <h2 style={styles.sectionTitle}>Dekorácie</h2>
-            <div style={styles.sectionHeaderRow} className="section-row">
-              <div style={styles.centerGroup} className="center-group">
-                <select
-                  value={selectedDecorations ?? ''}
-                  onChange={(e) => onSelectDecorations(e.target.value)}
-                  style={styles.select}
-                >
-                  <option value="" disabled hidden>Vyberte možnosť</option>
-                  {decorationsOptions.map((opt) => (
-                    <option key={opt.id} value={opt.id}>{opt.name}</option>
-                  ))}
-                </select>
-
-                <div style={styles.priceBox}>{fmt(decorationsPrice)}</div>
-
-                <button
-                  className="toggle-btn"
-                  aria-expanded={isDecorationsOpen}
-                  onClick={() => setIsDecorationsOpen((v) => !v)}
-                  style={{ transform: isDecorationsOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}
-                  title={isDecorationsOpen ? 'Skryť detaily' : 'Zobraziť detaily'}
-                >
-                  ▾
-                </button>
-              </div>
-            </div>
-
-            {isDecorationsOpen && (
-              <div style={styles.detailBubble}>
-                <div style={styles.detailBubbleText}>{sectionMeta['decorations'] || 'Popis dekorácií'}</div>
-              </div>
-            )}
-          </section>
-
-          {/* Logistics section */}
-          <section style={styles.section}>
-            <h2 style={styles.sectionTitle}>Logistika</h2>
-            <div style={styles.sectionHeaderRow}>
-              <div style={styles.centerGroup}>
-                <select
-                  value={selectedLogistics ?? ''}
-                  onChange={(e) => onSelectLogistics(e.target.value)}
-                  style={styles.select}
-                >
-                  <option value="" disabled hidden>Vyberte možnosť</option>
-                  {logisticsOptions.map((opt) => (
-                    <option key={opt.id} value={opt.id}>{opt.name}</option>
-                  ))}
-                </select>
-
-                <div style={styles.priceBox}>{fmt(logisticsPrice)}</div>
-
-                <button
-                  className="toggle-btn"
-                  aria-expanded={isLogisticsOpen}
-                  onClick={() => setIsLogisticsOpen((v) => !v)}
-                  style={{ transform: isLogisticsOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}
-                  title={isLogisticsOpen ? 'Skryť detaily' : 'Zobraziť detaily'}
-                >
-                  ▾
-                </button>
-              </div>
-            </div>
-
-            {isLogisticsOpen && (
-              <div style={styles.detailBubble}>
-                <div style={styles.detailBubbleText}>{sectionMeta['logistics'] || 'Popis logistiky'}</div>
-              </div>
-            )}
-          </section>
-
-          {/* Cena section */}
-          <section style={styles.section}>
-            <h2 style={styles.sectionTitle}>Cena</h2>
-            
-            <div style={styles.sectionHeaderRow}>
-              <div style={styles.centerGroup}>
-                {/* Compact slider with inline label and tooltip */}
-                <div style={styles.rewardRow} className="reward-row">
-                  <span style={styles.rewardLabel}>Odmena pre tvorcu</span>
-                  <div style={styles.sliderWrap} className="slider-wrap">
-                    <input
-                      type="range"
-                      min={0}
-                      max={50}
-                      step={0.01}
-                      value={rewardAmount}
-                      onChange={(e) => setRewardAmount(Number(e.target.value))}
-                      style={styles.sliderSmall}
-                    />
-                    {/* Tooltip above thumb - centered perfectly */}
-                    {(() => {
-                      const min = 0;
-                      const max = 50;
-                      const percent = ((rewardAmount - min) / (max - min)) * 100;
-                      return (
-                        <div style={{
-                          position: 'absolute',
-                          left: `${percent}%`,
-                          top: '-24px',
-                          transform: 'translateX(-50%)',
-                          background: '#ffffff',
-                          border: '1px solid #e0e6f0',
-                          borderRadius: '6px',
-                          padding: '2px 6px',
-                          fontSize: '0.75rem',
-                          color: '#333',
-                          boxShadow: '0 1px 3px rgba(0,0,0,0.12)',
-                          pointerEvents: 'none',
-                          whiteSpace: 'nowrap',
-                          zIndex: 10,
-                        }}>
-                          {rewardAmount.toFixed(2)} €
-                        </div>
-                      );
-                    })()}
+              {dynSec.isOpen && (
+                <>
+                  {dynSec.description && !dynSec.description.toLowerCase().includes('spodny popis') && (
+                    <div style={styles.sectionDescription}>{dynSec.description}</div>
+                  )}
+                  <div style={styles.sectionHeaderRow}>
+                    <div style={styles.centerGroup}>
+                      <select
+                        value={dynSec.selectedId ?? ''}
+                        onChange={(e) => {
+                          const newId = e.target.value;
+                          onSelectDynamic(dynSec.key, newId);
+                        }}
+                        style={{
+                          ...styles.select,
+                          border: (dynSec.required && !dynSec.selectedId && showRequiredHint) ? '2px solid #ff6b6b' : '2px solid #e0e6f0',
+                          backgroundColor: (dynSec.required && !dynSec.selectedId && showRequiredHint) ? '#fff5f5' : '#ffffff',
+                        }}
+                      >
+                        <option value="" disabled hidden>Vyberte možnosť</option>
+                        {dynSec.options.map((opt) => (
+                          <option key={opt.id} value={opt.id}>{opt.name}</option>
+                        ))}
+                      </select>
+                      <div style={styles.priceBox}>
+                        {(() => {
+                          const selectedOpt = dynSec.options.find(o => o.id === dynSec.selectedId);
+                          const price = selectedOpt?.price ?? null;
+                          return `${(price ?? 0).toFixed(2)} €`;
+                        })()}
+                      </div>
+                    </div>
                   </div>
-                </div>
-
-                <div style={styles.rightGroup} className="right-group">
-                  <div style={styles.priceBoxTotal}>{`${totalPrice.toFixed(2)} €`}</div>
-                  <button
-                    className="toggle-btn"
-                    aria-expanded={isRewardOpen}
-                    onClick={() => setIsRewardOpen((v) => !v)}
-                    style={{ transform: isRewardOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}
-                    title={isRewardOpen ? 'Skryť detaily' : 'Zobraziť detaily'}
-                  >
-                    ▾
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {isRewardOpen && hasAnySelected && (
-              <div style={styles.detailBubble}>
-                <div style={styles.breakdownList}>
-                  {selectedDiameterObj && (
-                    <div style={styles.breakdownRow}>
-                      <div style={styles.breakdownName}>{selectedDiameterObj.name}</div>
-                      <div style={styles.breakdownPrice}>{(diameterPrice ?? 0).toFixed(2)} €</div>
-                      <button
-                        style={styles.breakdownRemove}
-                        onClick={() => { setSelectedSize(null); setDiameterPrice(null); }}
-                        title="Zrušiť položku"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  )}
-                  {selectedHeightObj && (
-                    <div style={styles.breakdownRow}>
-                      <div style={styles.breakdownName}>{selectedHeightObj.name}</div>
-                      <div style={styles.breakdownPrice}>{(heightPrice ?? 0).toFixed(2)} €</div>
-                      <button
-                        style={styles.breakdownRemove}
-                        onClick={() => { setSelectedHeight(null); setHeightPrice(null); }}
-                        title="Zrušiť položku"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  )}
-                  {selectedInnerCreamObj && (
-                    <div style={styles.breakdownRow}>
-                      <div style={styles.breakdownName}>{selectedInnerCreamObj.name}</div>
-                      <div style={styles.breakdownPrice}>{(innerCreamPrice ?? 0).toFixed(2)} €</div>
-                      <button
-                        style={styles.breakdownRemove}
-                        onClick={() => { setSelectedInnerCream(null); setInnerCreamPrice(null); }}
-                        title="Zrušiť položku"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  )}
-                  {selectedOuterCreamObj && (
-                    <div style={styles.breakdownRow}>
-                      <div style={styles.breakdownName}>{selectedOuterCreamObj.name}</div>
-                      <div style={styles.breakdownPrice}>{(outerCreamPrice ?? 0).toFixed(2)} €</div>
-                      <button
-                        style={styles.breakdownRemove}
-                        onClick={() => { setSelectedOtherCream(null); setOuterCreamPrice(null); }}
-                        title="Zrušiť položku"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  )}
-                  {selectedExtraObj && (
-                    <div style={styles.breakdownRow}>
-                      <div style={styles.breakdownName}>{selectedExtraObj.name}</div>
-                      <div style={styles.breakdownPrice}>{(extraPrice ?? 0).toFixed(2)} €</div>
-                      <button
-                        style={styles.breakdownRemove}
-                        onClick={() => { setSelectedExtra(null); setExtraPrice(null); }}
-                        title="Zrušiť položku"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  )}
-                  {selectedFruitObj && (
-                    <div style={styles.breakdownRow}>
-                      <div style={styles.breakdownName}>{selectedFruitObj.name}</div>
-                      <div style={styles.breakdownPrice}>{(fruitPrice ?? 0).toFixed(2)} €</div>
-                      <button
-                        style={styles.breakdownRemove}
-                        onClick={() => { setSelectedFruit(null); setFruitPrice(null); }}
-                        title="Zrušiť položku"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  )}
-                  {selectedDecorationsObj && (
-                    <div style={styles.breakdownRow}>
-                      <div style={styles.breakdownName}>{selectedDecorationsObj.name}</div>
-                      <div style={styles.breakdownPrice}>{(decorationsPrice ?? 0).toFixed(2)} €</div>
-                      <button
-                        style={styles.breakdownRemove}
-                        onClick={() => { setSelectedDecorations(null); setDecorationsPrice(null); }}
-                        title="Zrušiť položku"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  )}
-                  {selectedLogisticsObj && (
-                    <div style={styles.breakdownRow}>
-                      <div style={styles.breakdownName}>{selectedLogisticsObj.name}</div>
-                      <div style={styles.breakdownPrice}>{(logisticsPrice ?? 0).toFixed(2)} €</div>
-                      <button
-                        style={styles.breakdownRemove}
-                        onClick={() => { setSelectedLogistics(null); setLogisticsPrice(null); }}
-                        title="Zrušiť položku"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-          </section>
-
-          {/* Add to Cart Button */}
-          <section style={styles.section} className="section-card">
-            <button
-              onClick={addToCart}
-              disabled={!isValid}
-              style={{
-                ...styles.addToCartButton,
-                ...(isValid ? {} : styles.addToCartButtonDisabled),
-              }}
-            >
-              🛒 Vložiť do košíka
-            </button>
-          </section>
+                </>
+              )}
+            </section>
+          ))}
 
         </div>
 
       {/* Cart Sidebar */}
       {isCartOpen && (
         <>
-          <div style={styles.cartOverlay} onClick={() => setIsCartOpen(false)} />
           <div style={styles.cartSidebar}>
             <div style={styles.cartHeader}>
               <h2 style={styles.cartTitle}>Košík ({cart.length})</h2>
-              <button onClick={() => setIsCartOpen(false)} style={styles.cartCloseBtn}>✕</button>
+              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                <button onClick={() => setIsCartOpen(false)} style={styles.cartCloseBtn}>✕</button>
+              </div>
             </div>
             <div style={styles.cartContent}>
               {cart.length === 0 ? (
                 <p style={styles.cartEmpty}>Košík je prázdny</p>
               ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  <div style={styles.cartHeaderLabels}>
-                    <div style={styles.headerLabel}>Počet</div>
-                    <div style={styles.headerLabelCenter}>Udalosť</div>
-                    <div style={styles.headerLabelRight}>Cena</div>
-                  </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                   {cart.map((item) => (
-                    <div key={item.id} style={styles.cartRowCompact}>
-                      <div style={styles.qtyGroup}>
-                        <button onMouseDown={(e) => e.preventDefault()} onClick={() => decreaseItemQuantity(item.id)} style={styles.arrowBtn} title="Menej">‹</button>
-                        <span style={styles.qtyNumber}>{item.quantity}x</span>
-                        <button onMouseDown={(e) => e.preventDefault()} onClick={() => increaseItemQuantity(item.id)} style={styles.arrowBtn} title="Viac">›</button>
+                    <div
+                      key={item.id}
+                      onClick={() => {
+                        // Just set the active item; do not prune others
+                        setActiveItemId(item.id);
+                      }}
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '0.5rem',
+                        padding: '0.5rem 0.75rem',
+                        backgroundColor: activeItemId === item.id ? '#ffe0ea' : '#f8f9fa',
+                        borderRadius: '10px',
+                        cursor: 'pointer',
+                        border: activeItemId === item.id ? '2px solid #ff9fc4' : '2px solid transparent',
+                        boxShadow: activeItemId === item.id ? '0 2px 6px rgba(255, 159, 196, 0.25)' : 'none',
+                        transition: 'background-color 0.2s, border-color 0.2s',
+                      }}
+                    >
+                      <div style={styles.breakdownList}>
+                        {/* Render ALL dynamic selections */}
+                        {item.dynamicSelections && Object.entries(item.dynamicSelections).map(([secKey, name]) => {
+                          const dsec = dynamicSections.find(d => d.key === secKey);
+                          const label = dsec?.label || secKey.split('_').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                          const price = dsec?.options.find(o => o.name === name)?.price ?? 0;
+                          return (
+                            <div key={`${item.id}-${secKey}`} style={styles.breakdownRow}>
+                              <div style={styles.breakdownName}>{label}: {name}</div>
+                              <div style={styles.breakdownPrice}>{price.toFixed(2)} €</div>
+                              <button
+                                style={styles.breakdownRemove}
+                                onClick={() => removeDynamicPart(item.id, secKey)}
+                                title="Zrušiť položku"
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          );
+                        })}
                       </div>
-                      <input
-                        type="text"
-                        value={item.eventName}
-                        onChange={(e) => updateEventName(item.id, e.target.value)}
-                        style={styles.cartItemInput}
-                      />
-                      <div style={styles.priceBare}>{(item.totalPrice * item.quantity).toFixed(2)} €</div>
-                      <button onClick={() => removeCartItem(item.id)} style={styles.removeItemBtn} title="Odstrániť">✕</button>
+                      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                        <div style={styles.priceBare}>{(item.totalPrice * item.quantity).toFixed(2)} €</div>
+                      </div>
                     </div>
                   ))}
-                  <button onMouseDown={(e) => e.preventDefault()} onClick={exportCartToPDF} style={styles.pdfExportBtn} title="Exportovať do PDF">
+                  {(() => {
+                    const requiredSections = dynamicSections.filter(s => s.required);
+                    const allHaveRequired = cart.every(it => requiredSections.every(ds => Boolean(it.dynamicSelections?.[ds.key])));
+                    return (
+                      <button
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => {
+                          if (!allHaveRequired) {
+                            setShowRequiredHint(true);
+                            return;
+                          }
+                          const newItem: CartItem = {
+                            id: Date.now().toString(),
+                            dynamicSelections: {},
+                            reward: 0,
+                            totalPrice: 0,
+                            quantity: 1,
+                            eventName: `Torta #${cart.length + 1}`,
+                          };
+                          setCart(prev => [...prev, newItem]);
+                          setActiveItemId(newItem.id);
+                          setDynamicSections(prev => prev.map(ds => ({ ...ds, selectedId: null })));
+                          setShowRequiredHint(false);
+                        }}
+                        style={styles.addCakeBtn}
+                        title={allHaveRequired ? "Pridať ďalšiu tortu" : "Vyplňte všetky povinné polia vo všetkých tortách"}
+                      >
+                        + ďalšia torta
+                      </button>
+                    );
+                  })()}
+                  <button
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      const requiredSections = dynamicSections.filter(s => s.required);
+                      const allHaveRequired = cart.every(it => requiredSections.every(ds => Boolean(it.dynamicSelections?.[ds.key])));
+                      if (!allHaveRequired) {
+                        setShowRequiredHint(true);
+                        return;
+                      }
+                      exportCartToPDF();
+                    }}
+                    style={styles.pdfExportBtn}
+                    title={(() => {
+                      const requiredSections = dynamicSections.filter(s => s.required);
+                      const allHaveRequired = cart.every(it => requiredSections.every(ds => Boolean(it.dynamicSelections?.[ds.key])));
+                      return allHaveRequired ? 'Exportovať do PDF' : 'Vyplňte povinné polia vo všetkých tortách';
+                    })()}
+                  >
                     📄 Exportovať do PDF
                   </button>
                 </div>
@@ -1076,9 +696,27 @@ export function HomePage() {
             </div>
             {cart.length > 0 && (
               <div style={styles.cartFooterElevated}>
-                <button onMouseDown={(e) => e.preventDefault()} onClick={() => setIsEmailModalOpen(true)} style={styles.totalButton} title="Záväzne objednať">
-                  Záväzne objednať • {cart.reduce((sum, item) => sum + (item.totalPrice * item.quantity), 0).toFixed(2)} €
-                </button>
+                {(() => {
+                  const requiredSections = dynamicSections.filter(s => s.required);
+                  const allHaveRequired = cart.every(it => requiredSections.every(ds => Boolean(it.dynamicSelections?.[ds.key])));
+                  return (
+                    <button
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => {
+                        if (allHaveRequired) {
+                          setIsEmailModalOpen(true);
+                        } else {
+                          // trigger required hint (red highlight) for missing ones
+                          setShowRequiredHint(true);
+                        }
+                      }}
+                      style={styles.totalButton}
+                      title={allHaveRequired ? 'Záväzne objednať' : 'Vyplňte povinné polia pre každú tortu'}
+                    >
+                      Záväzne objednať • {cart.reduce((sum, item) => sum + (item.totalPrice * item.quantity), 0).toFixed(2)} €
+                    </button>
+                  );
+                })()}
               </div>
             )}
           </div>
@@ -1240,31 +878,25 @@ const styles = {
     color: '#333',
     fontSize: '0.95rem',
   } as React.CSSProperties,
-  detailBubble: {
-    marginTop: '0.75rem',
-    background: '#eaf4ff',
-    border: '1px solid #d7ecff',
-    padding: '0 0.75rem',
-    borderRadius: '10px',
-    minHeight: '46px',
-    display: 'flex',
-    alignItems: 'center',
-  } as React.CSSProperties,
-  detailBubbleText: {
-    color: '#063b66',
-    fontSize: '0.95rem',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap' as const,
-    width: '100%',
-  } as React.CSSProperties,
   sectionTitle: {
     margin: 0,
     textAlign: 'left' as const,
     fontSize: '1.1rem',
     flex: '1',
     color: '#ffc4d6',
+  } as React.CSSProperties,
+  sectionTitleRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     marginBottom: '0.75rem',
+  } as React.CSSProperties,
+  sectionDescription: {
+    fontSize: '0.85rem',
+    fontStyle: 'italic',
+    color: '#666',
+    marginBottom: '0.75rem',
+    lineHeight: '1.4',
   } as React.CSSProperties,
   toggleButton: {
     background: 'transparent',
@@ -1274,13 +906,14 @@ const styles = {
     height: '34px',
     minWidth: '34px',
     flex: '0 0 34px',
-    fontSize: '0.85rem',
+    fontSize: '1.5rem',
     cursor: 'pointer',
     color: '#5b8fd9',
     display: 'flex' as const,
     alignItems: 'center',
     justifyContent: 'center',
     padding: 0,
+    transformOrigin: '50% 50%',
     transition: 'transform 0.18s ease',
   } as React.CSSProperties,
   buttonRow: {
@@ -1356,54 +989,7 @@ const styles = {
   slider: {
     width: '100%',
   } as React.CSSProperties,
-  rewardRow: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.75rem',
-    flex: 1,
-    flexWrap: 'wrap' as const,
-    minWidth: 0,
-  } as React.CSSProperties,
-  rewardLabel: {
-    fontSize: '0.85rem',
-    color: '#64748b',
-    whiteSpace: 'nowrap' as const,
-    letterSpacing: '0.02em',
-    fontWeight: 600,
-  } as React.CSSProperties,
-  sliderWrap: {
-    position: 'relative' as const,
-    flex: 1,
-    minWidth: '120px',
-    maxWidth: '350px',
-    marginLeft: '0.25rem',
-    marginRight: '0.25rem',
-  } as React.CSSProperties,
-  sliderSmall: {
-    width: '100%',
-    height: '6px',
-    appearance: 'none' as const,
-    background: '#e9edf3',
-    borderRadius: '999px',
-    outline: 'none',
-  } as React.CSSProperties,
-  rightGroup: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.75rem',
-    marginLeft: 'auto',
-  } as React.CSSProperties,
-  priceBoxTotal: {
-    padding: '0.5rem 0.75rem',
-    backgroundColor: '#ff69a5',
-    border: '1px solid #ff4d94',
-    color: '#ffffff',
-    borderRadius: '8px',
-    fontWeight: 700,
-    minWidth: 80,
-    textAlign: 'center' as const,
-    boxShadow: '0 2px 4px rgba(255,105,165,0.3)',
-  } as React.CSSProperties,
+  
   priceBreakdown: {
     display: 'flex',
     flexDirection: 'column' as const,
@@ -1420,40 +1006,45 @@ const styles = {
     display: 'flex',
     flexDirection: 'column' as const,
     gap: '0.5rem',
-    padding: '0.5rem 0.75rem',
+    padding: '0.5rem 0',
     width: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
   } as React.CSSProperties,
   breakdownRow: {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: '1rem',
-    padding: '0.4rem 0.5rem',
-    backgroundColor: '#f8fafc',
-    borderRadius: '6px',
+    padding: '0.4rem 0.75rem',
+    backgroundColor: '#eaf3ff',
+    borderRadius: 10,
+    width: '90%',
   } as React.CSSProperties,
   breakdownName: {
-    color: '#334155',
+    color: '#1a1a1a',
     fontSize: '0.95rem',
     flex: 1,
     overflow: 'hidden',
     textOverflow: 'ellipsis',
     whiteSpace: 'nowrap' as const,
+    fontWeight: 600,
   } as React.CSSProperties,
   breakdownPrice: {
     fontWeight: 600,
-    color: '#0f766e',
+    color: '#0b6b5f',
     minWidth: '96px',
     textAlign: 'right' as const,
   } as React.CSSProperties,
   breakdownRemove: {
-    background: '#f1f5f9',
-    border: '1px solid #e2e8f0',
-    color: '#475569',
+    background: '#6fa8ff',
+    border: '1px solid #4a7dc9',
+    color: '#1f1f1f',
     borderRadius: '6px',
     cursor: 'pointer',
     padding: '0.25rem 0.5rem',
     fontSize: '0.85rem',
+    fontWeight: 700,
   } as React.CSSProperties,
   cartButton: {
     background: 'transparent',
@@ -1480,23 +1071,7 @@ const styles = {
     fontSize: '0.7rem',
     fontWeight: 'bold',
   } as React.CSSProperties,
-  addToCartButton: {
-    width: '100%',
-    padding: '1rem',
-    backgroundColor: '#ee59b5ff',
-    color: 'white',
-    border: 'none',
-    borderRadius: '8px',
-    fontSize: '1.1rem',
-    fontWeight: 'bold',
-    cursor: 'pointer',
-    transition: 'background 0.2s',
-  } as React.CSSProperties,
-  addToCartButtonDisabled: {
-    backgroundColor: '#ccc',
-    cursor: 'not-allowed',
-    opacity: 0.6,
-  } as React.CSSProperties,
+  
   cartOverlay: {
     position: 'fixed' as const,
     top: 0,
@@ -1543,140 +1118,30 @@ const styles = {
     overflowY: 'auto' as const,
     padding: '1rem',
   } as React.CSSProperties,
-  cartHeaderLabels: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'flex-start',
-    gap: '0.5rem',
-    paddingBottom: '0.5rem',
-    borderBottom: '1px solid #e6e6e9',
-    marginBottom: '0.25rem',
-  } as React.CSSProperties,
-  headerLabel: {
-    fontSize: '0.75rem',
-    color: '#888',
-    fontWeight: 500,
-    textTransform: 'uppercase' as const,
-    letterSpacing: '0.5px',
-    width: '95px',
-  } as React.CSSProperties,
-  headerLabelCenter: {
-    fontSize: '0.75rem',
-    color: '#888',
-    fontWeight: 500,
-    textTransform: 'uppercase' as const,
-    letterSpacing: '0.5px',
-    flex: 1,
-  } as React.CSSProperties,
-  headerLabelRight: {
-    fontSize: '0.75rem',
-    color: '#888',
-    fontWeight: 500,
-    textTransform: 'uppercase' as const,
-    letterSpacing: '0.5px',
-    width: '90px',
-    textAlign: 'right' as const,
-    paddingRight: '1.5rem',
-  } as React.CSSProperties,
+  
   cartEmpty: {
     textAlign: 'center' as const,
     color: '#999',
     padding: '2rem',
   } as React.CSSProperties,
-  cartItem: {
-    backgroundColor: '#f9f9f9',
-    border: '1px solid #e6e6e9',
-    borderRadius: '8px',
-    padding: '1rem',
-    marginBottom: '1rem',
-  } as React.CSSProperties,
-  cartItemHeader: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    marginBottom: '0.5rem',
-  } as React.CSSProperties,
-  cartItemRemove: {
-    background: '#dc3545',
-    color: 'white',
-    border: 'none',
-    borderRadius: '4px',
-    padding: '0.25rem 0.5rem',
-    cursor: 'pointer',
-    fontSize: '0.9rem',
-  } as React.CSSProperties,
-  cartItemDetails: {
-    fontSize: '0.9rem',
-    color: '#666',
-    marginBottom: '0.5rem',
-  } as React.CSSProperties,
-  cartItemPrice: {
-    fontSize: '1.2rem',
-    fontWeight: 'bold',
-    color: '#28a745',
-    textAlign: 'right' as const,
-  } as React.CSSProperties,
-  cartFooter: {
-    padding: '1rem',
-    borderTop: '1px solid #e6e6e9',
-  } as React.CSSProperties,
-  cartTotal: {
-    fontSize: '1.5rem',
-    fontWeight: 'bold',
-    textAlign: 'right' as const,
-    color: '#333',
-  } as React.CSSProperties,
-  cartTotalInline: {
-    fontSize: '1rem',
-    fontWeight: 600,
-    color: '#333',
-  } as React.CSSProperties,
-  pdfButton: {
-    padding: '0.75rem 1rem',
-    backgroundColor: '#5b8fd9',
-    color: '#fff',
-    border: 'none',
-    borderRadius: '8px',
-    fontSize: '1rem',
-    cursor: 'pointer',
-    boxShadow: '0 1px 2px rgba(0,0,0,0.06)',
-  } as React.CSSProperties,
-  pdfIconButton: {
-    width: '52px',
-    height: '52px',
-    borderRadius: '10px',
-    border: '1px solid #e6e6e9',
-    backgroundColor: '#ffffff',
-    fontSize: '1.5rem',
-    cursor: 'pointer',
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    boxShadow: '0 1px 2px rgba(16,24,40,0.06)',
-  } as React.CSSProperties,
+  
   cartItemSummary: {
     flex: 1,
     fontSize: '0.9rem',
     color: '#555',
     fontWeight: 500,
   } as React.CSSProperties,
-  cartItemInput: {
-    width: '110px',
-    fontSize: '0.85rem',
-    color: '#333',
-    fontWeight: 500,
-    border: '1px solid #e6e6e9',
-    borderRadius: '6px',
-    padding: '0.3rem 0.4rem',
-    backgroundColor: '#ffffff',
-    outline: 'none',
-  } as React.CSSProperties,
-  removeItemBtn: {
+  
+  addCakeBtn: {
     background: 'transparent',
+    color: '#5b8fd9',
     border: 'none',
-    color: '#dc3545',
-    fontSize: '1rem',
+    outline: 'none',
+    padding: '0.5rem 0',
+    fontSize: '0.9rem',
     cursor: 'pointer',
-    padding: '0 0.25rem',
+    textAlign: 'left' as const,
+    fontWeight: 500,
   } as React.CSSProperties,
   pdfExportBtn: {
     width: '100%',
@@ -1690,42 +1155,7 @@ const styles = {
     cursor: 'pointer',
     marginTop: '0.5rem',
   } as React.CSSProperties,
-  cartRowCompact: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'flex-start',
-    gap: '0.5rem',
-    padding: '0.5rem 0.75rem',
-    backgroundColor: '#f8f9fa',
-    borderRadius: '10px',
-  } as React.CSSProperties,
-  qtyGroup: {
-    display: 'inline-flex',
-    alignItems: 'center',
-    gap: '0.15rem',
-    backgroundColor: '#ffffff',
-    borderRadius: '8px',
-    padding: '0.25rem 0.4rem',
-    border: '1px solid #e6e6e9',
-  } as React.CSSProperties,
-  arrowBtn: {
-    background: 'transparent',
-    border: 'none',
-    outline: 'none',
-    boxShadow: 'none',
-    color: '#333',
-    fontSize: '1.1rem',
-    cursor: 'pointer',
-    lineHeight: 1,
-    padding: '0 0.2rem',
-  } as React.CSSProperties,
-  qtyNumber: {
-    minWidth: '28px',
-    textAlign: 'center' as const,
-    fontWeight: 700,
-    color: '#111',
-    fontSize: '0.95rem',
-  } as React.CSSProperties,
+  
   priceBare: {
     marginLeft: 'auto',
     fontSize: '1.1rem',

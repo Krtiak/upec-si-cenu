@@ -64,16 +64,6 @@ button:focus-visible {
   outline: 4px auto -webkit-focus-ring-color;
 }
 
-/* Remove harsh focus ring from native selects (keeps rounded border) */
-select {
-  outline: none;
-}
-select:focus,
-select:focus-visible {
-  outline: none;
-  box-shadow: none;
-}
-
 /* Toggle button specific styling: show subtle border on hover */
 .toggle-btn {
   background: #5184b6;

@@ -1,7 +1,4 @@
-// Setup type definitions for built-in Supabase Runtime APIs
-/// <reference types="https://esm.sh/@supabase/functions-js/src/edge-runtime.d.ts" />
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-
+// Email sending function for Supabase Edge Runtime
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
 const ADMIN_EMAIL = "janspano01@gmail.com"; // Zmeň na tvoj admin email
 

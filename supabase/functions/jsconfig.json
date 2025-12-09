@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "skipLibCheck": true,
+    "noImplicitAny": false,
+    "allowJs": true,
+    "checkJs": false,
+    "moduleResolution": "node",
+    "noEmit": true
+  },
+  "exclude": ["node_modules", ".git"]
+}

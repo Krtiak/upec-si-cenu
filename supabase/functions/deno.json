@@ -1,5 +1,5 @@
 {
-  "importMap": "./import_map.json",
+  "importMap": "import_map.json",
   "compilerOptions": {
     "lib": ["esnext", "dom", "deno.ns"],
     "strict": true

@@ -1,7 +1,1 @@
-{
-  "files": [],
-  "references": [
-    { "path": "./tsconfig.app.json" },
-    { "path": "./tsconfig.node.json" }
-  ]
-}
+{"compilerOptions":{"lib":["deno.window"],"moduleResolution":"bundler","allowImportingTsExtensions":true,"noEmit":true}}

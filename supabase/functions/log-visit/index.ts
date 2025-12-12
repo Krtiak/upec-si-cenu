@@ -20,6 +20,36 @@ const supabase = createClient(SUPABASE_URL!, SERVICE_ROLE_KEY!, {
 
 interface VisitPayload { path?: string }
 
+// Geolocation function using ip-api.com
+async function getLocationFromIP(ip: string): Promise<{ city?: string; country?: string } | null> {
+  try {
+    // Skip private IPs
+    if (ip === 'localhost' || ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
+      return null;
+    }
+    
+    const response = await fetch(`http://ip-api.com/json/${ip}?fields=city,country`, {
+      method: 'GET',
+    });
+    
+    if (!response.ok) return null;
+    
+    const data = await response.json();
+    
+    if (data.status === 'success') {
+      return {
+        city: data.city || undefined,
+        country: data.country || undefined,
+      };
+    }
+    
+    return null;
+  } catch (err) {
+    console.error('Geolocation error:', err);
+    return null;
+  }
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
@@ -33,6 +63,9 @@ Deno.serve(async (req: Request) => {
     const ip = ipRaw.split(',')[0].trim();
     const userAgent = req.headers.get('user-agent') || 'unknown';
 
+    // Get geolocation data
+    const location = await getLocationFromIP(ip);
+
     // Optional anonymization: hash IP instead of storing raw
     // const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ip));
     // const ipHash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -41,6 +74,8 @@ Deno.serve(async (req: Request) => {
       path: visitPath,
       ip, // replace with ipHash if anonymizing
       user_agent: userAgent,
+      city: location?.city || null,
+      country: location?.country || null,
     });
 
     if (error) throw error;

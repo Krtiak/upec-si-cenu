@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 
@@ -32,6 +32,32 @@ styleSheet.textContent = `
     background: #a5d6a7 !important;
     color: #333 !important;
     font-weight: 600;
+  }
+  .upec-section-placeholder {
+    background: rgba(255,255,255,0.96);
+    border: 2px dashed #f79ec5;
+    border-radius: 8px;
+    box-sizing: border-box;
+    transition: background 120ms ease, border-color 120ms ease;
+    min-height: 36px;
+    display: block;
+  }
+  .upec-section-drag-clone {
+    background: white !important;
+    border-radius: 8px;
+    overflow: hidden;
+    opacity: 0.99;
+    transform-origin: center top;
+    border: 1px solid rgba(0,0,0,0.06);
+    box-shadow: 0 18px 50px rgba(0,0,0,0.22);
+  }
+  /* When dragging, prevent text selection / highlighting while hovering other sections */
+  .upec-dragging, .upec-dragging * {
+    -webkit-user-select: none !important;
+    -moz-user-select: none !important;
+    -ms-user-select: none !important;
+    user-select: none !important;
+    -webkit-touch-callout: none !important;
   }
 `;
 if (typeof document !== 'undefined') {
@@ -88,8 +114,17 @@ export function AdminPanel() {
 
   const [saving, setSaving] = useState(false);
   const [activeTab, setActiveTab] = useState<'UI' | 'Recepty' | 'Ingrediencie' | 'Navstevnost'>('UI');
+  const [sectionOrder, setSectionOrder] = useState<string[]>([]);
+  const [draggingKey, setDraggingKey] = useState<string | null>(null);
+  const [hasSectionMetaSortOrder, setHasSectionMetaSortOrder] = useState<boolean | null>(null);
+  // Drag visual state: placeholder index and overlay position
+  // placeholderIndex removed; DOM placeholder used instead
+  const [dragOverlayPos, setDragOverlayPos] = useState<{ x: number; y: number } | null>(null);
+  const [dragOffsetY, setDragOffsetY] = useState<number>(0);
+  const [dragOverlayRect, setDragOverlayRect] = useState<{ width: number; left: number; height: number } | null>(null);
 
   // Ingredients state
+  const realDraggedEl = useRef<HTMLElement | null>(null);
   type Unit = 'ml' | 'g' | 'l' | 'kg' | 'ks';
   interface Ingredient { id?: string; name: string; unit: Unit; price: number; packageSize: number; indivisible: boolean }
   const UNITS: Unit[] = ['ml','g','l','kg','ks'];
@@ -118,6 +153,12 @@ export function AdminPanel() {
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+
+  // Diameter management state
+  const [diameterEnabled, setDiameterEnabled] = useState<Record<string, boolean>>({});
+  const [diameterMultipliersMap, setDiameterMultipliersMap] = useState<Record<string, number>>({}); // key: `${sectionKey}:${optionId}`
+  const [baseDiameterBySection, setBaseDiameterBySection] = useState<Record<string, string | null>>({});
+  const [editingMultiplierKey, setEditingMultiplierKey] = useState<string | null>(null);
 
   // Farebné schémy pre jednotlivé taby
   const tabColors = {
@@ -269,20 +310,25 @@ export function AdminPanel() {
 
   async function loadFromDb() {
     try {
-      // Fetch all section meta (bottom descriptions)
+      // Fetch all section meta (bottom descriptions). Try to detect `sort_order` presence.
       let meta: any[] | null = null;
       let metaErr: any = null;
-      {
+      try {
+        const { data, error } = await supabase
+          .from('section_meta')
+          .select('section, description, required, sort_order');
+        meta = data as any[] | null;
+        metaErr = error;
+        if (!metaErr) {
+          // If we were able to query sort_order successfully, mark support
+          setHasSectionMetaSortOrder(true);
+        }
+      } catch (e) {
+        // Older DB without sort_order
+        setHasSectionMetaSortOrder(false);
         const { data, error } = await supabase
           .from('section_meta')
           .select('section, description, required');
-        meta = data as any[] | null;
-        metaErr = error;
-      }
-      if (metaErr) {
-        const { data, error } = await supabase
-          .from('section_meta')
-          .select('section, description');
         if (error) throw error;
         meta = (data as any[] | null) || [];
       }
@@ -334,6 +380,58 @@ export function AdminPanel() {
       // Update state atomically
       setKeyToLabel(nextKeyToLabel);
       setSections(nextSections);
+      // Initialize section order: prefer `sort_order` from meta when available,
+      // otherwise use discovered keys (meta keys first, then option-only keys)
+      try {
+        let orderedKeys: string[] = [];
+        if (meta && meta.length && meta.some((m: any) => m && typeof m.sort_order !== 'undefined')) {
+          orderedKeys = (meta as any[])
+            .slice()
+            .sort((a: any, b: any) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0))
+            .map((m: any) => m.section)
+            // append any keys not present in meta (from options)
+            .concat(keysFromOpts.filter(k => !meta.some((m: any) => m.section === k)));
+          setHasSectionMetaSortOrder(true);
+        } else {
+          orderedKeys = [...allKeysSet];
+        }
+        setSectionOrder(orderedKeys);
+        // If DB doesn't support sort_order, but user has a stored order in localStorage,
+        // prefer that so Admin's manual reordering survives refresh until DB is migrated.
+        try {
+          if (!hasSectionMetaSortOrder && typeof window !== 'undefined' && window.localStorage) {
+            const stored = window.localStorage.getItem('upec_section_order');
+            if (stored) {
+              const arr = JSON.parse(stored);
+              if (Array.isArray(arr) && arr.length) {
+                setSectionOrder(arr);
+              }
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+      } catch (e) {
+        setSectionOrder([...allKeysSet]);
+      }
+      // load which sections have diameter entries
+      // Load which sections have diameter entries and load their multipliers
+      try {
+        const { data: keysRows, error: keysErr } = await supabase
+          .from('diameter_multipliers')
+          .select('section_key');
+        if (!keysErr && keysRows) {
+          const keys = Array.from(new Set((keysRows || []).map((r: any) => r.section_key).filter(Boolean)));
+          const map: Record<string, boolean> = {};
+          keys.forEach(k => { map[k] = true; });
+          setDiameterEnabled(map);
+          for (const sk of keys) {
+            try { await loadDiameterMultipliers(sk); } catch (e) { console.warn('Failed to load multipliers for', sk, e); }
+          }
+        }
+      } catch (e) {
+        console.warn('Warning: loading diameter sections failed on startup', e);
+      }
     } catch (err) {
       console.error('Load from DB failed:', err);
       alert('⚠️ Nepodarilo sa načítať dáta z databázy');
@@ -358,6 +456,91 @@ export function AdminPanel() {
       })));
     } catch (err) {
       console.error('Load ingredients failed:', err);
+    }
+  }
+
+  async function loadDiameterMultipliers(sectionKey: string) {
+    try {
+      const { data, error } = await supabase
+        .from('diameter_multipliers')
+        .select('*')
+        .eq('section_key', sectionKey);
+      if (error) throw error;
+      const map: Record<string, number> = {};
+      let baseId: string | null = null;
+      (data || []).forEach((d: any) => {
+        const k = `${sectionKey}:${d.option_id}`;
+        map[k] = Number(d.multiplier) || 1;
+        if (d.base_option_id) baseId = d.base_option_id;
+      });
+      setDiameterMultipliersMap(prev => ({ ...prev, ...map }));
+      setBaseDiameterBySection(prev => ({ ...prev, [sectionKey]: baseId || null }));
+    } catch (err) {
+      console.error('Load diameter multipliers failed:', err);
+    }
+  }
+
+  async function toggleDiameterSection(sectionKey: string, enable: boolean, allOptions: Array<{ id?: string; name: string }>) {
+    try {
+      if (!enable) {
+        const { error } = await supabase.from('diameter_multipliers').delete().eq('section_key', sectionKey);
+        if (error) throw error;
+        setDiameterEnabled(prev => ({ ...prev, [sectionKey]: false }));
+        // remove from maps
+        setBaseDiameterBySection(prev => { const c = { ...prev }; delete c[sectionKey]; return c; });
+        setDiameterMultipliersMap(prev => {
+          const copy = { ...prev };
+          Object.keys(prev).forEach(k => { if (k.startsWith(sectionKey + ':')) delete copy[k]; });
+          return copy;
+        });
+        return;
+      }
+
+      // create default entries with multiplier 1
+      // Resolve current DB option ids for this section (match by name)
+      const { data: dbOpts = [], error: dbErr } = await supabase
+        .from('section_options')
+        .select('id, name')
+        .eq('section', sectionKey);
+      if (dbErr) throw dbErr;
+      const nameToId: Record<string, string> = {};
+      (dbOpts || []).forEach((r: any) => { if (r?.id && r?.name) nameToId[r.name] = r.id; });
+
+      const entries = (allOptions || []).map(o => {
+        const dbId = nameToId[o.name];
+        return dbId ? {
+          section_key: sectionKey,
+          base_option_id: null,
+          option_id: dbId,
+          multiplier: 1.0,
+        } : null;
+      }).filter(Boolean) as any[];
+      const { error } = await supabase.from('diameter_multipliers').insert(entries);
+      if (error) throw error;
+      setDiameterEnabled(prev => ({ ...prev, [sectionKey]: true }));
+      await loadDiameterMultipliers(sectionKey);
+    } catch (err) {
+      console.error('Toggle diameter section failed:', err);
+      alert('⚠️ Nepodarilo sa zapnúť/vypnúť správu priemerov');
+    }
+  }
+
+  // (removed unused `setBaseDiameter` helper)
+
+  async function updateMultiplier(sectionKey: string, optionId: string, newMultiplier: number) {
+    try {
+      // round to 1 decimal before saving
+      const rounded = Math.round((newMultiplier || 1) * 10) / 10;
+      const { error } = await supabase
+        .from('diameter_multipliers')
+        .update({ multiplier: rounded })
+        .eq('section_key', sectionKey)
+        .eq('option_id', optionId);
+      if (error) throw error;
+      setDiameterMultipliersMap(prev => ({ ...prev, [`${sectionKey}:${optionId}`]: rounded }));
+    } catch (err) {
+      console.error('Update multiplier failed:', err);
+      alert('⚠️ Nepodarilo sa aktualizovať násobok');
     }
   }
 
@@ -548,17 +731,23 @@ export function AdminPanel() {
     const pkg = ri.packageSize && ri.packageSize > 0 ? ri.packageSize : 1;
     const price = Number(ri.price) || 0;
     const qty = ri.quantity || 0;
+    let cost: number;
     if (ri.indivisible) {
       // Always round up to nearest full package
       const packagesNeeded = Math.ceil(qty / pkg);
-      return packagesNeeded * price;
+      cost = packagesNeeded * price;
+    } else {
+      cost = (price * qty) / pkg;
     }
-    return (price * qty) / pkg;
+    // Vždy zaokrúhli na 2 desatinné miesta (ako skutočné eurá)
+    return Math.round(cost * 100) / 100;
   }
 
   function getRecipeTotalPrice(recipeId: string): number {
     const recipeIngs = recipeIngredientsByRecipe[recipeId] || [];
-    return recipeIngs.reduce((sum, ri) => sum + getIngredientCost(ri), 0);
+    const total = recipeIngs.reduce((sum, ri) => sum + getIngredientCost(ri), 0);
+    // Vždy zaokrúhli na 2 desatinné miesta (ako skutočné eurá)
+    return Math.round(total * 100) / 100;
   }
 
   function addOption(sectionKey: string) {
@@ -616,6 +805,7 @@ export function AdminPanel() {
       delete next[sectionKey];
       return next;
     });
+    setSectionOrder(prev => prev.filter(k => k !== sectionKey));
   }
 
   function addNewSection() {
@@ -634,6 +824,349 @@ export function AdminPanel() {
       ...prev,
       [key]: { name: label, description: label, required: false, options: [] }
     }));
+    setSectionOrder(prev => [...prev, key]);
+  }
+
+  // Drag & drop handlers for reordering sections
+  const sectionRefs = useRef<Record<string, HTMLElement | null>>({});
+  const placeholderNode = useRef<HTMLElement | null>(null);
+  const sectionListContainer = useRef<HTMLElement | null>(null);
+  const draggedClone = useRef<HTMLElement | null>(null);
+  const pointerDragging = useRef<boolean>(false);
+  const pointerIdRef = useRef<number | null>(null);
+
+  function setSectionRef(key: string, el: HTMLElement | null) {
+    sectionRefs.current[key] = el;
+  }
+
+  // FLIP animation for reordering: animate elements from their previous position to new
+  function animateReorder(prevOrder: string[], nextOrder: string[]) {
+    try {
+      const beforeRects: Record<string, DOMRect> = {};
+      prevOrder.forEach(k => {
+        const el = sectionRefs.current[k];
+        if (el) beforeRects[k] = el.getBoundingClientRect();
+      });
+
+      // Allow DOM to update with new order first
+      requestAnimationFrame(() => {
+        const afterRects: Record<string, DOMRect> = {};
+        nextOrder.forEach(k => {
+          const el = sectionRefs.current[k];
+          if (el) afterRects[k] = el.getBoundingClientRect();
+        });
+
+        nextOrder.forEach(k => {
+          const el = sectionRefs.current[k];
+          const before = beforeRects[k];
+          const after = afterRects[k];
+          if (!el || !before || !after) return;
+          const dx = before.left - after.left;
+          const dy = before.top - after.top;
+          if (dx === 0 && dy === 0) return;
+          el.style.transition = 'none';
+          el.style.transform = `translate(${dx}px, ${dy}px)`;
+          // trigger reflow
+          el.getBoundingClientRect();
+          el.style.transition = 'transform 220ms cubic-bezier(.2,.8,.2,1)';
+          el.style.transform = '';
+          const cleanup = () => {
+            el.style.transition = '';
+            el.style.transform = '';
+            el.removeEventListener('transitionend', cleanup);
+          };
+          el.addEventListener('transitionend', cleanup);
+        });
+      });
+    } catch (e) {
+      // ignore animation errors
+    }
+  }
+  
+
+  // Unified finalizer for any drag type (clone-based or real-element)
+  function finalizeDragCleanup() {
+    try {
+      // remove any global listeners that may have been attached during drag
+      try {
+        document.removeEventListener('pointermove', handlePointerMove);
+        document.removeEventListener('pointerup', handlePointerUp);
+        document.removeEventListener('pointercancel', handlePointerUp);
+        document.removeEventListener('dragover', handleDocumentDragOver);
+        document.removeEventListener('drop', handleDocumentDrop);
+        window.removeEventListener('blur', handleWindowBlur as any);
+        document.removeEventListener('visibilitychange', handleVisibilityChange as any);
+      } catch (e) {}
+
+      const dragged = draggingKey;
+      const ph = placeholderNode.current;
+      const parent = sectionListContainer.current || (ph ? ph.parentElement : null);
+
+      // Remove any visual clone
+      const clone = draggedClone.current;
+      if (clone) {
+        try { clone.remove(); } catch (e) {}
+        draggedClone.current = null;
+      }
+
+      // If we had moved the real DOM element into body, reinsert it at the placeholder
+      const real = realDraggedEl.current;
+      if (real) {
+        try {
+          if (ph && ph.parentElement) {
+            ph.parentElement.insertBefore(real, ph);
+          } else if (parent) {
+            parent.appendChild(real);
+          }
+        } catch (e) {}
+        // reset inline styles applied during drag
+        try {
+          real.style.position = '';
+          real.style.left = '';
+          real.style.top = '';
+          real.style.width = '';
+          real.style.zIndex = '';
+          real.style.pointerEvents = '';
+          real.style.boxShadow = '';
+          realDraggedEl.current = null;
+        } catch (e) {}
+      }
+
+      // Restore opacity/pointer for the original element if still present in refs
+      if (dragged) {
+        const el = sectionRefs.current[dragged];
+        if (el) {
+          try { el.style.opacity = ''; el.style.pointerEvents = ''; } catch (e) {}
+        }
+      }
+
+      // Remove placeholder and compute new order
+      if (ph && parent) {
+        try { ph.remove(); } catch (e) {}
+        placeholderNode.current = null;
+
+        const prev = sectionOrder.slice();
+        const keys: string[] = [];
+        Array.from(parent.querySelectorAll('[data-section-key]')).forEach((node: Element) => {
+          const k = node.getAttribute('data-section-key');
+          if (k) keys.push(k);
+        });
+        try { animateReorder(prev, keys); } catch (err) {}
+        setSectionOrder(keys);
+      }
+    } catch (err) {
+      console.warn('finalizeDragCleanup failed', err);
+    } finally {
+      try { document.body.classList.remove('upec-dragging'); document.body.style.cursor = ''; } catch (e) {}
+      setDraggingKey(null);
+      setDragOverlayPos(null);
+      setDragOverlayRect(null);
+      sectionListContainer.current = null;
+      pointerDragging.current = false;
+      pointerIdRef.current = null;
+    }
+  }
+
+  function handleWindowBlur() {
+    try { finalizeDragCleanup(); } catch (e) {}
+  }
+
+  function handleVisibilityChange() {
+    if (document.visibilityState === 'hidden') {
+      try { finalizeDragCleanup(); } catch (e) {}
+    }
+  }
+
+  // Pointer-based fallback for more reliable dragging (mouse/touch)
+  function onPointerDownSection(e: React.PointerEvent<HTMLElement>, key: string) {
+    // only primary button
+    if ((e as any).button && (e as any).button !== 0) return;
+    if (draggingKey) return;
+    // If pointer originates from an interactive control (input, textarea, select, dropdown button, etc.), don't start drag.
+    try {
+      const tgt = (e.target as HTMLElement | null);
+      if (tgt) {
+        // If it's the explicit drag-handle, allow; otherwise block for buttons/inputs
+        if (!tgt.closest('.upec-drag-handle')) {
+          if (tgt.closest('input, textarea, select, button, [data-dropdown-container]')) return;
+        }
+      }
+    } catch (err) {}
+    pointerDragging.current = true;
+    pointerIdRef.current = (e as any).pointerId || null;
+    // synthesize a drag start using the same clone/placeholder flow
+    try {
+      const el = sectionRefs.current[key];
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const parent = el.parentElement as HTMLElement | null;
+      if (!parent) return;
+      sectionListContainer.current = parent;
+      setDraggingKey(key);
+
+      const ph = document.createElement('div');
+      ph.style.width = `${rect.width}px`;
+      ph.style.height = `${rect.height}px`;
+      ph.style.boxSizing = 'border-box';
+      ph.style.margin = getComputedStyle(el).margin || '';
+      ph.className = 'upec-section-placeholder';
+      parent.insertBefore(ph, el);
+      placeholderNode.current = ph;
+
+      // Detach the real element and move it to document.body so the user is dragging
+      // the actual section DOM node (no clone). Insert placeholder to keep layout.
+      try {
+        parent.removeChild(el);
+        document.body.appendChild(el);
+        realDraggedEl.current = el;
+        el.style.position = 'fixed';
+        el.style.left = `${rect.left}px`;
+        el.style.top = `${rect.top}px`;
+        el.style.width = `${rect.width}px`;
+        el.style.zIndex = '9999';
+        el.style.pointerEvents = 'none';
+        el.style.boxShadow = '0 14px 40px rgba(0,0,0,0.18)';
+      } catch (err) {
+        console.warn('real-drag detach failed', err);
+      }
+
+      setDragOffsetY((e.clientY || 0) - rect.top || 0);
+      setDragOverlayRect({ width: rect.width, left: rect.left, height: rect.height });
+
+      document.addEventListener('pointermove', handlePointerMove);
+      document.addEventListener('pointerup', handlePointerUp);
+      document.addEventListener('pointercancel', handlePointerUp);
+      window.addEventListener('blur', handleWindowBlur as any);
+      document.addEventListener('visibilitychange', handleVisibilityChange as any);
+      try { document.body.classList.add('upec-dragging'); document.body.style.cursor = 'grabbing'; } catch (e) {}
+    } catch (err) {
+      console.warn('pointer drag start failed', err);
+      pointerDragging.current = false;
+      pointerIdRef.current = null;
+    }
+  }
+
+  function handlePointerMove(e: PointerEvent) {
+    if (!pointerDragging.current) return;
+    const ph = placeholderNode.current;
+    const parent = sectionListContainer.current;
+    const draggedEl = realDraggedEl.current || draggedClone.current;
+    if (!draggedEl || !ph || !parent) return;
+    try {
+      const clientY = e.clientY || 0;
+      const top = clientY - dragOffsetY;
+      draggedEl.style.top = `${top}px`;
+    } catch (err) {}
+
+    // reposition placeholder among parent's children
+    const children = Array.from(parent.children).filter(c => c !== ph);
+    let inserted = false;
+    for (const child of children) {
+      const rect = (child as HTMLElement).getBoundingClientRect();
+      const mid = rect.top + rect.height / 2;
+      if ((e.clientY || 0) < mid) {
+        if (ph.nextSibling !== child) parent.insertBefore(ph, child);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) parent.appendChild(ph);
+  }
+
+  function handlePointerUp() {
+    if (!pointerDragging.current) return;
+    pointerDragging.current = false;
+    pointerIdRef.current = null;
+    document.removeEventListener('pointermove', handlePointerMove);
+    document.removeEventListener('pointerup', handlePointerUp);
+
+    // finalize similar to document drop
+    try {
+      finalizeDragCleanup();
+    } catch (err) {
+      console.warn('pointer up finalize failed', err);
+    }
+  }
+
+  function onDragOverSection(e: React.DragEvent<HTMLElement>) {
+    // keep this noop - actual placeholder movement handled by document dragover
+    e.preventDefault();
+    try { if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'; } catch (e) {}
+  }
+
+  function handleDocumentDragOver(e: Event) {
+    const ev = e as DragEvent;
+    ev.preventDefault?.();
+    const draggedKey = draggingKey;
+    if (!draggedKey) return;
+    const ph = placeholderNode.current;
+    const parent = sectionListContainer.current;
+    const draggedEl = realDraggedEl.current || draggedClone.current;
+    if (!draggedEl || !ph || !parent) return;
+
+    // move the detached element to follow pointer
+    try {
+      const clientY = ev.clientY || 0;
+      const top = clientY - dragOffsetY;
+      draggedEl.style.top = `${top}px`;
+    } catch (err) {}
+
+    // compute insertion point among parent's children (excluding placeholder)
+    const children = Array.from(parent.children).filter(c => c !== ph);
+    let inserted = false;
+    for (const child of children) {
+      const rect = (child as HTMLElement).getBoundingClientRect();
+      const mid = rect.top + rect.height / 2;
+      if ((ev.clientY || 0) < mid) {
+        if (ph.nextSibling !== child) parent.insertBefore(ph, child);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) {
+      parent.appendChild(ph);
+    }
+  }
+
+  function handleDocumentDrop(e: Event) {
+    try {
+      (e as DragEvent).preventDefault?.();
+      document.removeEventListener('dragover', handleDocumentDragOver);
+      document.removeEventListener('drop', handleDocumentDrop);
+      try { finalizeDragCleanup(); } catch (err) { console.warn('document drop finalize failed', err); }
+    } catch (err) {
+      console.warn('document drop failed', err);
+    } finally {
+      // finalizeDragCleanup already resets state; ensure listeners removed
+      sectionListContainer.current = null;
+    }
+  }
+
+  function onDropSection(e: React.DragEvent<HTMLElement>) {
+    e.preventDefault();
+    try {
+      // remove document listeners
+      document.removeEventListener('dragover', handleDocumentDragOver);
+      document.removeEventListener('drop', handleDocumentDrop);
+      try { finalizeDragCleanup(); } catch (err) { console.warn('drop finalize failed', err); }
+    } catch (err) {
+      console.warn('drop finalize failed', err);
+    } finally {
+      // finalizeDragCleanup already resets state
+      sectionListContainer.current = null;
+    }
+  }
+
+  function onDragEndSection() {
+    // If drag ends without drop, cleanup
+    try {
+      document.removeEventListener('dragover', handleDocumentDragOver);
+      document.removeEventListener('drop', handleDocumentDrop);
+      try { finalizeDragCleanup(); } catch (err) { console.warn('drag end cleanup failed', err); }
+        } catch (err) {
+          console.warn('drag end cleanup failed', err);
+        }
+        // finalizeDragCleanup resets draggingKey
   }
 
   // Rename section: updates display label in section_meta
@@ -669,6 +1202,34 @@ export function AdminPanel() {
     setSaving(true);
 
     try {
+      // Detect whether DB supports `linked_recipe_id` column on `section_options`.
+      let hasLinkedColumn = false;
+      try {
+        const { error: testErr } = await supabase
+          .from('section_options')
+          .select('linked_recipe_id')
+          .limit(1);
+        if (!testErr) hasLinkedColumn = true;
+      } catch (e) {
+        hasLinkedColumn = false;
+      }
+
+      // Detect whether DB supports `sort_order` on `section_meta` (for persisting section order)
+      let useSortOrder = Boolean(hasSectionMetaSortOrder);
+      if (hasSectionMetaSortOrder === null) {
+        try {
+          const { error: tErr } = await supabase
+            .from('section_meta')
+            .select('sort_order')
+            .limit(1);
+          useSortOrder = !tErr;
+          setHasSectionMetaSortOrder(useSortOrder);
+        } catch (e) {
+          useSortOrder = false;
+          setHasSectionMetaSortOrder(false);
+        }
+      }
+
       console.log('🔵 Začínam ukladanie...');
       // Fetch existing sections in DB to detect deletions
       const { data: existingMeta, error: existingMetaErr } = await supabase
@@ -678,31 +1239,72 @@ export function AdminPanel() {
       const existingKeys = new Set<string>((existingMeta || []).map(m => m.section));
       
       // Save descriptions (section_meta) and options (section_options)
-      for (const key of Object.keys(sections)) {
+      const keysToSave = (sectionOrder && sectionOrder.length) ? sectionOrder : Object.keys(sections);
+      for (const key of keysToSave) {
         const section = sections[key];
         const label = keyToLabel[key] || key;
 
         console.log(`📝 Ukladám sekciu: ${label} (${key})`, section);
 
-        // Upsert section meta (one row per section)
-        let metaErr: any = null;
+        // Upsert section meta (one row per section). Try including `sort_order` when supported,
+        // but fall back to a payload without it if the DB does not have that column.
         try {
-          const { error } = await supabase
-            .from('section_meta')
-            .upsert({ section: key, description: section.description || '', required: Boolean(section.required) }, { onConflict: 'section' });
-          metaErr = error;
-          if (metaErr) throw metaErr;
-        } catch (_) {
-          const { error } = await supabase
-            .from('section_meta')
-            .upsert({ section: key, description: section.description || '' }, { onConflict: 'section' });
-          if (error) {
-            console.error(`❌ Meta error pre ${label}:`, error);
-            throw error;
+          const baseMetaPayload: any = {
+            section: key,
+            description: section.description || '',
+            required: Boolean(section.required),
+          };
+
+          if (useSortOrder) {
+            const idx = sectionOrder && sectionOrder.length ? sectionOrder.indexOf(key) : -1;
+            const metaPayloadWithOrder = { ...baseMetaPayload, sort_order: idx >= 0 ? idx : 0 };
+            const { error } = await supabase
+              .from('section_meta')
+              .upsert(metaPayloadWithOrder, { onConflict: 'section' });
+            if (error) {
+              // If the error indicates `sort_order` does not exist, retry without it and remember
+              // to skip `sort_order` next time.
+              console.warn('Warning: upsert with sort_order failed, retrying without sort_order', error);
+              const { error: err2 } = await supabase
+                .from('section_meta')
+                .upsert(baseMetaPayload, { onConflict: 'section' });
+              if (err2) throw err2;
+              setHasSectionMetaSortOrder(false);
+            }
+          } else {
+            const { error } = await supabase
+              .from('section_meta')
+              .upsert(baseMetaPayload, { onConflict: 'section' });
+            if (error) throw error;
           }
+        } catch (err) {
+          console.error(`❌ Meta error pre ${label}:`, err);
+          throw err;
         }
 
-        // Replace options for the section for simplicity
+        // Replace options for the section, but preserve/update any existing diameter_multipliers
+        // 1) fetch existing options + multipliers so we can remap by option name after re-insert
+        const { data: oldOptions = [], error: oldOptErr } = await supabase
+          .from('section_options')
+          .select('id, name')
+          .eq('section', key);
+        if (oldOptErr) {
+          console.error(`❌ Fetch old options error for ${label}:`, oldOptErr);
+          throw oldOptErr;
+        }
+        const oldOptMap: Record<string, string> = {}; // id -> name
+        (oldOptions || []).forEach((o: any) => { if (o?.id) oldOptMap[o.id] = o.name; });
+
+        const { data: existingMultipliers = [], error: multErr } = await supabase
+          .from('diameter_multipliers')
+          .select('id, option_id, base_option_id')
+          .eq('section_key', key);
+        if (multErr) {
+          console.error(`❌ Fetch multipliers error for ${label}:`, multErr);
+          throw multErr;
+        }
+
+        // Delete existing options (we will insert fresh ones)
         const { error: delErr } = await supabase
           .from('section_options')
           .delete()
@@ -713,22 +1315,128 @@ export function AdminPanel() {
         }
 
         if (section.options.length) {
-          const rows = section.options.map((opt, idx) => ({
-            section: key,
-            name: opt.name,
-            price: opt.price,
-            description: opt.description || '',
-            sort_order: idx,
-          }));
-          
+          const rows = section.options.map((opt, idx) => {
+            const baseRow: any = {
+              section: key,
+              name: opt.name,
+              price: opt.price,
+              description: opt.description || '',
+              sort_order: idx,
+            };
+            if (hasLinkedColumn && opt.linkedRecipeId) {
+              baseRow.linked_recipe_id = opt.linkedRecipeId;
+            }
+
+            return baseRow;
+          });
+
           console.log(`➕ Vkladám ${rows.length} možností pre ${label}:`, rows);
-          
-          const { error: insErr } = await supabase
+
+          // insert and return inserted ids + names so we can map
+          const { data: newInserted = [], error: insErr } = await supabase
             .from('section_options')
-            .insert(rows);
+            .insert(rows)
+            .select('id, name');
           if (insErr) {
             console.error(`❌ Insert error pre ${label}:`, insErr);
             throw insErr;
+          }
+
+          const newMap: Record<string, string> = {}; // name -> id
+          (newInserted || []).forEach((n: any) => { if (n?.id) newMap[n.name] = n.id; });
+
+          // Update local sections state so option ids match DB ids we just inserted.
+          // Remap existing in-memory multipliers and base selection from old option ids to new DB ids
+          try {
+            // Build name->oldId map from previously fetched oldOptions
+            const oldNameToId: Record<string, string> = {};
+            (oldOptions || []).forEach((o: any) => { if (o?.id && o?.name) oldNameToId[o.name] = o.id; });
+
+            // Remap diameterMultipliersMap keys that reference old ids to new ids
+            setDiameterMultipliersMap(prev => {
+              const copy = { ...prev };
+              Object.keys(newMap).forEach(name => {
+                const oldId = oldNameToId[name];
+                const newId = newMap[name];
+                if (oldId && newId) {
+                  const oldKey = `${key}:${oldId}`;
+                  const newKey = `${key}:${newId}`;
+                  if (Object.prototype.hasOwnProperty.call(prev, oldKey)) {
+                    copy[newKey] = prev[oldKey];
+                    delete copy[oldKey];
+                  }
+                }
+              });
+              return copy;
+            });
+
+            // Update baseDiameterBySection if it referenced an old option id
+            setBaseDiameterBySection(prev => {
+              const curBase = prev[key];
+              if (!curBase) return prev;
+              // If current base matches an old id, map to the new id
+              const nameForOld = oldOptMap[curBase];
+              if (nameForOld && newMap[nameForOld]) {
+                return { ...prev, [key]: newMap[nameForOld] };
+              }
+              return prev;
+            });
+          } catch (e) {
+            console.warn('Warning: remapping local multiplier ids failed', e);
+          }
+
+          setSections(prev => {
+            const cur = prev[key];
+            if (!cur) return prev;
+            const updatedOptions = (cur.options || []).map((o: any) => ({ ...o, id: newMap[o.name] || o.id }));
+            return { ...prev, [key]: { ...cur, options: updatedOptions } };
+          });
+
+          // If diameter management is enabled for this section, recreate/upsert multiplier rows
+          try {
+            if (Boolean(diameterEnabled[key])) {
+              // Determine base name from current UI state if set
+              const baseFrontendId = baseDiameterBySection[key];
+              let baseName: string | null = null;
+              if (baseFrontendId) {
+                const frontendOpt = section.options.find((o: any) => o.id === baseFrontendId);
+                if (frontendOpt) baseName = frontendOpt.name;
+              }
+
+              // If base not found via frontend id, try to infer from existingMultipliers (old base)
+                      if (!baseName && (existingMultipliers || []).length) {
+                        const maybe = (existingMultipliers || []).find((m: any) => m.base_option_id);
+                if (maybe) {
+                  const oldBaseName = oldOptMap[maybe.base_option_id];
+                  if (oldBaseName) baseName = oldBaseName;
+                }
+              }
+
+              const baseDbId = baseName ? newMap[baseName] : null;
+
+              const entries = (section.options || []).map((o: any) => {
+                const optDbId = newMap[o.name];
+                if (!optDbId) return null;
+                const optSize = parseFloat(o.name);
+                const baseSize = baseName ? parseFloat(baseName) : NaN;
+                const mult = (isNaN(optSize) || isNaN(baseSize)) ? 1.0 : Math.pow(optSize / baseSize, 2);
+                return {
+                  section_key: key,
+                  base_option_id: baseDbId,
+                  option_id: optDbId,
+                  multiplier: Number(mult.toFixed(1)),
+                };
+              }).filter(Boolean) as any[];
+
+              if (entries.length) {
+                const { error: upsertErr } = await supabase
+                  .from('diameter_multipliers')
+                  .upsert(entries, { onConflict: 'section_key,option_id' });
+                if (upsertErr) console.warn('Warning: failed to upsert diameter multipliers for', key, upsertErr);
+              }
+            }
+          } catch (e) {
+            console.warn('Warning: failed to recreate/upsert multipliers for section', key, e);
           }
         }
         
@@ -781,8 +1489,77 @@ export function AdminPanel() {
         }
       }
 
+      // Ensure diameter_multipliers rows exist for sections with the toggle enabled.
+      try {
+        for (const sectionKey of keysToSave) {
+          if (!Boolean(diameterEnabled[sectionKey])) continue;
+          // check if multiplier rows exist
+          const { data: existing = [], error: exErr } = await supabase
+            .from('diameter_multipliers')
+            .select('option_id')
+            .eq('section_key', sectionKey)
+            .limit(1);
+          if (exErr) {
+            console.warn('Warning: cannot verify diameter rows for', sectionKey, exErr);
+            continue;
+          }
+          if ((existing || []).length === 0) {
+            // insert default multiplier rows (1.0) for all options in this section
+            const { data: opts, error: optsErr } = await supabase
+              .from('section_options')
+              .select('id')
+              .eq('section', sectionKey);
+            if (optsErr) {
+              console.warn('Warning: cannot fetch section options for', sectionKey, optsErr);
+              continue;
+            }
+            const entries = (opts || []).map((o: any) => ({
+              section_key: sectionKey,
+              base_option_id: null,
+              option_id: o.id,
+              multiplier: 1.0,
+            }));
+            if (entries.length) {
+              const { error: insErr } = await supabase.from('diameter_multipliers').insert(entries);
+              if (insErr) console.warn('Warning: failed to insert default diameter rows for', sectionKey, insErr);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Warning: post-save diameter persistence check failed', e);
+      }
+
+      // Refresh diameter multipliers state so base selection and multipliers reflect saved DB
+      try {
+        // fetch distinct section_key values present in DB and reload them
+        const { data: keysRows, error: keysErr } = await supabase
+          .from('diameter_multipliers')
+          .select('section_key');
+        if (!keysErr && keysRows) {
+          const keys = Array.from(new Set((keysRows || []).map((r: any) => r.section_key).filter(Boolean)));
+          const map: Record<string, boolean> = {};
+          keys.forEach(k => { map[k] = true; });
+          setDiameterEnabled(map);
+          for (const sk of keys) {
+            await loadDiameterMultipliers(sk);
+          }
+        } else if (keysErr) {
+          console.warn('Warning: failed to fetch diameter section keys after save', keysErr);
+        }
+      } catch (e) {
+        console.warn('Warning: failed to reload diameter multipliers after save', e);
+      }
+
       console.log('🎉 Všetko uložené!');
       alert('✅ Zmeny úspešne uložené do databázy!');
+      // Persist order into localStorage as a fallback when DB doesn't support sort_order
+      try {
+        if (!useSortOrder && typeof window !== 'undefined' && window.localStorage) {
+          window.localStorage.setItem('upec_section_order', JSON.stringify(sectionOrder || []));
+        }
+      } catch (e) {
+        // ignore
+      }
     } catch (err) {
       console.error('❌ Chyba pri ukladaní:', err);
       alert(`❌ Chyba pri ukladaní: ${err instanceof Error ? err.message : 'Neznáma chyba'}`);
@@ -922,17 +1699,53 @@ export function AdminPanel() {
         {activeTab === 'UI' && (
           <>
           {/* Dynamically render all sections */}
-          {Object.keys(sections).map((sectionKey) => {
-            const section = sections[sectionKey];
-            const label = keyToLabel[sectionKey] || sectionKey;
-            return (
-              <section key={sectionKey} style={{
-                ...styles.section,
-                backgroundColor: '#fff',
-                border: `2px solid ${currentColors.border}`,
-              }}>
+          {(sectionOrder && sectionOrder.length ? sectionOrder : Object.keys(sections)).map((sectionKey) => {
+              const section = sections[sectionKey];
+              const label = keyToLabel[sectionKey] || sectionKey;
+              return (
+                <section
+                  key={sectionKey}
+                  data-section-key={sectionKey}
+                  ref={(el) => setSectionRef(sectionKey, el)}
+                  draggable={false}
+                  onDragOver={(e) => onDragOverSection(e)}
+                  onDrop={onDropSection}
+                  onDragEnd={onDragEndSection}
+                  onPointerDown={(e) => onPointerDownSection(e, sectionKey)}
+                  style={{
+                    ...styles.section,
+                    backgroundColor: '#fff',
+                    border: `2px solid ${currentColors.border}`,
+                    willChange: 'transform'
+                  }}
+                >
                 <div style={styles.sectionHeader}>
-                  <input
+                  {/* Left group: drag handle + title input */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}> 
+                    <button
+                      type="button"
+                      onPointerDown={(e) => { e.preventDefault(); onPointerDownSection(e, sectionKey); }}
+                      title="Presuň sekciu"
+                      aria-label="Presuň sekciu"
+                      className="upec-drag-handle"
+                      style={{
+                        cursor: 'grab',
+                        marginRight: 0,
+                        border: 'none',
+                        background: 'transparent',
+                        padding: '0.25rem 0.5rem',
+                        borderRadius: 6,
+                        fontSize: '16px',
+                        lineHeight: 1,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center'
+                      }}
+                    >
+                      ≡
+                    </button>
+
+                    <input
                     type="text"
                     defaultValue={label}
                     onBlur={(e) => {
@@ -943,14 +1756,18 @@ export function AdminPanel() {
                     }}
                     style={{
                       ...styles.sectionTitle,
-                      color: '#ffffffff',
+                      color: '#333',
                       margin: 0,
                       border: '1px solid ' + currentColors.border,
                       borderRadius: '6px',
                       padding: '0.5rem 0.75rem',
                       backgroundColor: '#f79ec5',
+                      width: 'auto',
+                      maxWidth: '520px',
+                      textAlign: 'left'
                     }}
                   />
+                  </div>
                   <button
                     onClick={() => removeSection(sectionKey)}
                     style={styles.removeSectionButton}
@@ -1004,7 +1821,15 @@ export function AdminPanel() {
                               alignItems: 'center',
                               justifyContent: 'center',
                             }}
-                            onClick={() => setSectionOptionDropdownOpen(prev => ({ ...prev, [dropdownKey]: !prev[dropdownKey] }))}
+                            onClick={() => setSectionOptionDropdownOpen(prev => {
+                              // Ak je dropdown otvorený, zatvor ho; ak je zatvorený, otvor len tento a zatvor všetky ostatné
+                              if (prev[dropdownKey]) {
+                                return { ...prev, [dropdownKey]: false };
+                              } else {
+                                // Zatvor všetky ostatné a otvor len tento
+                                return { [dropdownKey]: true };
+                              }
+                            })}
                           >
                             ▼
                           </button>
@@ -1135,6 +1960,105 @@ export function AdminPanel() {
                             </button>
                           </div>
                         </div>
+
+                        {/* Small multiplier pill: click pill to edit, click row to set base */}
+                        {diameterEnabled[sectionKey] && opt.id && (
+                          <div
+                            onClick={() => {
+                              // Only update local UI state and multipliers; persist on Save
+                              try {
+                                setBaseDiameterBySection(prev => ({ ...prev, [sectionKey]: opt.id! }));
+                                // compute local multipliers based on area scaling so UI updates immediately
+                                const baseSize = parseFloat(opt.name);
+                                const newMap: Record<string, number> = {};
+                                (section.options || []).forEach(o => {
+                                  const optSize = parseFloat(o.name);
+                                  const mult = (isNaN(optSize) || isNaN(baseSize)) ? 1.0 : Math.pow(optSize / baseSize, 2);
+                                  newMap[`${sectionKey}:${o.id}`] = Number(mult.toFixed(1));
+                                });
+                                setDiameterMultipliersMap(prev => ({ ...prev, ...newMap }));
+                              } catch (e) {
+                                console.error('Local set base failed:', e);
+                                alert('Nepodarilo sa lokálne nastaviť základný priemer');
+                              }
+                            }}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'flex-end',
+                              gap: '8px',
+                              marginLeft: '12px',
+                              minWidth: 0,
+                            }}
+                            title={baseDiameterBySection[sectionKey] === opt.id ? 'Základný priemer' : 'Klikni pre nastavenie základného priemeru'}
+                          >
+                            
+
+                            {/* multiplier pill: small fixed-width; click pill to edit (stopPropagation) */}
+                            {editingMultiplierKey === `${sectionKey}:${opt.id}` ? (
+                              <input
+                                autoFocus
+                                onClick={e => e.stopPropagation()}
+                                onFocus={e => (e.target as HTMLInputElement).select()}
+                                type="number"
+                                step="0.1"
+                                defaultValue={(diameterMultipliersMap[`${sectionKey}:${opt.id}`] ?? 1).toFixed(1)}
+                                onBlur={async (e) => {
+                                  const v = parseFloat((e.target as HTMLInputElement).value) || 1;
+                                  await updateMultiplier(sectionKey, opt.id!, v);
+                                  setEditingMultiplierKey(null);
+                                }}
+                                onKeyDown={async (e) => {
+                                  if (e.key === 'Enter') {
+                                    const v = parseFloat((e.target as HTMLInputElement).value) || 1;
+                                    await updateMultiplier(sectionKey, opt.id!, v);
+                                    setEditingMultiplierKey(null);
+                                  } else if (e.key === 'Escape') {
+                                    setEditingMultiplierKey(null);
+                                  }
+                                }}
+                                style={{
+                                  width: 64,
+                                  padding: '6px 8px',
+                                  borderRadius: 8,
+                                  border: '1px solid ' + currentColors.border,
+                                  textAlign: 'center',
+                                  fontWeight: 700,
+                                  background: '#fff'
+                                }}
+                              />
+                            ) : (
+                              <div
+                                style={{
+                                  padding: '6px 10px',
+                                  borderRadius: 8,
+                                  background: baseDiameterBySection[sectionKey] === opt.id ? currentColors.secondary : '#fff',
+                                  color: baseDiameterBySection[sectionKey] === opt.id ? '#fff' : '#333',
+                                  fontWeight: 800,
+                                  cursor: 'pointer',
+                                  width: 64,
+                                  textAlign: 'center',
+                                  boxShadow: baseDiameterBySection[sectionKey] === opt.id ? `0 6px 18px ${currentColors.secondary}30` : 'none',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center'
+                                }}
+                                title="Klikni pre nastavenie základu alebo klikni na číslo pre edit"
+                                onPointerDown={(e) => { e.stopPropagation(); }}
+                              >
+                                <span
+                                  onPointerDown={(e) => { e.stopPropagation(); }}
+                                  onClick={(e) => { e.stopPropagation(); setEditingMultiplierKey(`${sectionKey}:${opt.id}`); }}
+                                  style={{ display: 'inline-block' }}
+                                  className="upec-no-drag"
+                                >
+                                  {(diameterMultipliersMap[`${sectionKey}:${opt.id}`] ?? 1).toFixed(1)}x
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
                           <button
                             onClick={() => removeOption(sectionKey, idx)}
                             style={styles.removeButton}
@@ -1144,7 +2068,7 @@ export function AdminPanel() {
                         </div>
                       </div>
                     );
-                  })}
+                    })}
                 </div>
                 <button
                   onClick={() => addOption(sectionKey)}
@@ -1166,8 +2090,29 @@ export function AdminPanel() {
                     accentColor: currentColors.secondary,
                     marginLeft: '1rem', 
                     verticalAlign: 'middle',
-                    filter: section.required ? 'none' : 'opacity(0.5) saturate(0.3)',
+                    filter: section.required ? 'none' : 'opacity(0.5) saturate(0.3)'
                   }}
+                  title="Povinné pole"
+                />
+
+                {/* Toggle: enable diameter management for this section */}
+                <input
+                  type="checkbox"
+                  checked={Boolean(diameterEnabled[sectionKey])}
+                  onChange={async (e) => {
+                    const enable = e.target.checked;
+                    // create/delete multiplier rows
+                    await toggleDiameterSection(sectionKey, enable, section.options || []);
+                  }}
+                  style={{ 
+                    width: '22px', 
+                    height: '22px', 
+                    cursor: 'pointer', 
+                    accentColor: currentColors.secondary,
+                    marginLeft: '0.6rem', 
+                    verticalAlign: 'middle'
+                  }}
+                  title="Spravovať priemery (nastaviť základ a násobky)"
                 />
                 <div style={styles.descriptionSection}>
                   <textarea
@@ -1181,6 +2126,30 @@ export function AdminPanel() {
             );
           })}
           
+          {/* Drag overlay (ghost of dragged section) */}
+          {dragOverlayPos && dragOverlayRect && draggingKey && (
+            <div style={{
+              position: 'fixed',
+              left: dragOverlayRect.left,
+              width: dragOverlayRect.width,
+              top: (dragOverlayPos.y - dragOffsetY),
+              height: dragOverlayRect.height,
+              pointerEvents: 'none',
+              zIndex: 9999,
+              boxShadow: '0 10px 30px rgba(0,0,0,0.15)',
+              transform: 'translateZ(0) scale(0.995)',
+              background: '#fff',
+              border: `2px solid ${currentColors.border}`,
+              borderRadius: 10,
+              padding: '0.5rem 0.75rem',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem'
+            }}>
+              <div style={{ flex: 1, fontWeight: 700, color: currentColors.text }}>{keyToLabel[draggingKey] || draggingKey}</div>
+            </div>
+          )}
+
           {/* Button to add new section */}
           <div style={{ marginTop: '2rem', textAlign: 'center' }}>
             <button
@@ -1818,6 +2787,8 @@ export function AdminPanel() {
     </>
   );
 }
+
+// Removed no-op reference to `loadDiameterEnabledSections`.
 
 const styles = {
   container: {

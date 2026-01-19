@@ -19,6 +19,8 @@ interface OrderPayload {
   customerName: string;
   items: OrderItem[];
   total: number;
+  pdfBase64?: string | null;
+  pdfFilename?: string | null;
 }
 
 Deno.serve(async (req: Request) => {
@@ -28,7 +30,7 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { customerEmail, customerName, items, total }: OrderPayload = await req.json();
+    const { customerEmail, customerName, items, total, pdfBase64, pdfFilename }: OrderPayload = await req.json();
 
     if (!RESEND_API_KEY) {
       throw new Error("RESEND_API_KEY is not set");
@@ -70,8 +72,14 @@ Deno.serve(async (req: Request) => {
       </div>
     `;
 
-    // Poslať email adminovi
-    const adminEmailResponse = await fetch("https://api.resend.com/emails", {
+    // Prepare optional attachment (Resend API format: filename + content)
+    const attachments = [] as Array<{ filename: string; content: string }>;
+    if (pdfBase64 && pdfFilename) {
+      attachments.push({ filename: pdfFilename, content: pdfBase64 });
+    }
+
+    // Poslať email adminovi (promise, nech beží paralelne)
+    const adminEmailResponse = fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -82,51 +90,64 @@ Deno.serve(async (req: Request) => {
         to: [ADMIN_EMAIL],
         subject: `Nová objednávka od ${customerName}`,
         html: emailHtml,
+        attachments: attachments.length ? attachments : undefined,
       }),
     });
 
-    const adminResult = await adminEmailResponse.json();
-    console.log("Admin email response:", adminResult);
+    // Pošli admin aj customer email paralelne; admin chyba je blokujúca, customer je "best effort"
+    const adminPromise = (async () => {
+      const resp = await adminEmailResponse;
+      const body = await resp.json();
+      if (!resp.ok || body?.error) {
+        throw new Error(body?.error || `Admin email failed with status: ${resp.status}`);
+      }
+      return body;
+    })();
 
-    // Poslať potvrdenie zákazníkovi
-    const customerEmailResponse = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${RESEND_API_KEY}`,
-      },
-      body: JSON.stringify({
-        from: "Torty <onboarding@resend.dev>",
-        to: [customerEmail],
-        subject: "Potvrdenie objednávky",
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2>Ďakujeme za objednávku!</h2>
-            <p>Dobrý deň ${customerName},</p>
-            <p>Vaša objednávka bola úspešne prijatá. Čoskoro Vás budeme kontaktovať.</p>
-            ${emailHtml}
-            <p>S pozdravom,<br>Váš tím</p>
-          </div>
-        `,
-      }),
-    });
+    const customerPromise = (async () => {
+      try {
+        const resp = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${RESEND_API_KEY}`,
+          },
+          body: JSON.stringify({
+            from: "Torty <onboarding@resend.dev>",
+            to: [customerEmail],
+            subject: "Potvrdenie objednávky",
+            html: `
+              <div style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;\">
+                <h2>Ďakujeme za objednávku!</h2>
+                <p>Dobrý deň ${customerName},</p>
+                <p>Vaša objednávka bola úspešne prijatá. Čoskoro Vás budeme kontaktovať.</p>
+                ${emailHtml}
+                <p>S pozdravom,<br>Váš tím</p>
+              </div>
+            `,
+            attachments: attachments.length ? attachments : undefined,
+          }),
+        });
+        const body = await resp.json();
+        if (!resp.ok || body?.error) {
+          throw new Error(body?.error || `Customer email failed with status: ${resp.status}`);
+        }
+        return body;
+      } catch (err) {
+        return err instanceof Error ? err : new Error(String(err));
+      }
+    })();
 
-    const customerResult = await customerEmailResponse.json();
-    console.log("Customer email response:", customerResult);
-
-    // Kontrola, či Resend vrátil error (nie HTTP status, ale v JSON)
-    if (adminResult.error || customerResult.error) {
-      const errorMsg = `Email errors: Admin: ${adminResult.error || 'OK'}, Customer: ${customerResult.error || 'OK'}`;
-      console.error(errorMsg);
-      throw new Error(errorMsg);
-    }
+    const [adminResult, customerResult] = await Promise.all([adminPromise, customerPromise]);
+    const customerError = customerResult instanceof Error ? customerResult.message : null;
 
     return new Response(
       JSON.stringify({ 
         success: true, 
-        message: "Emails sent successfully",
+        message: customerError ? "Admin email sent; customer email may have failed" : "Emails sent successfully",
         adminId: adminResult.id,
-        customerId: customerResult.id
+        customerId: customerResult instanceof Error ? null : customerResult?.id || null,
+        customerError,
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 200 }
     );

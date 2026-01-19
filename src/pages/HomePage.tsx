@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { jsPDF } from 'jspdf';
 import EmailModal from '../components/EmailModal';
 import { supabase } from '../lib/supabase';
@@ -11,12 +11,15 @@ export function HomePage() {
     price: number;
     description: string | null;
     sort_order: number;
+    linkedRecipeId?: string | null;
   }
 
   const [loading, setLoading] = useState(true);
   const [isCartOpen, setIsCartOpen] = useState<boolean>(false);
   const [activeItemId, setActiveItemId] = useState<string | null>(null);
   const [isEmailModalOpen, setIsEmailModalOpen] = useState<boolean>(false);
+  const [isSubmittingOrder, setIsSubmittingOrder] = useState<boolean>(false);
+  const [orderSuccess, setOrderSuccess] = useState<boolean>(false);
   // Admin emails loading is paused until notifications are wired
 
   interface CartItem {
@@ -30,6 +33,11 @@ export function HomePage() {
   }
   const [cart, setCart] = useState<CartItem[]>([]);
 
+  // Keep a ref of cart so effects that should only react to `activeItemId`
+  // don't need to include `cart` in their dependency array (prevents loop).
+  const cartRef = useRef<CartItem[]>(cart);
+  useEffect(() => { cartRef.current = cart; }, [cart]);
+
   // State pre dynamické sekcie (nové sekcie pridané v AdminPanel)
   interface DynamicSectionData {
     key: string;
@@ -41,22 +49,95 @@ export function HomePage() {
     required?: boolean;
   }
   const [dynamicSections, setDynamicSections] = useState<DynamicSectionData[]>([]);
+  const [diameterMultipliersMap, setDiameterMultipliersMap] = useState<Record<string, number>>({});
+  const [multByOptionId, setMultByOptionId] = useState<Record<string, number>>({});
+  
+  const [recipesByName, setRecipesByName] = useState<Record<string,string>>({});
+  
+
+  // Helper: find an applicable diameter multiplier for a given option (and optional cart item).
+  function findApplicableDiameterMultiplier(targetSectionKey: string, item?: CartItem) {
+    const managed = Array.from(new Set(Object.keys(diameterMultipliersMap).map(k => k.split(':')[0])));
+    
+    for (const m of managed) {
+      if (m === targetSectionKey) continue; // don't use the same section as the option itself
+      // item-level selection takes precedence
+      let diaOptionId: string | undefined;
+      if (item) {
+        const itemSelName = item.dynamicSelections?.[m];
+        if (itemSelName) {
+          const sec = dynamicSections.find(d => d.key === m);
+          diaOptionId = sec?.options.find(op => op.name === itemSelName)?.id;
+        }
+      }
+      // otherwise use global selected id for that section
+      if (!diaOptionId) diaOptionId = dynamicSections.find(d => d.key === m)?.selectedId || undefined;
+      if (diaOptionId) {
+        const lookupKey = `${m}:${diaOptionId}`;
+        let mult = diameterMultipliersMap[lookupKey];
+        // Fallback: try to match by option id suffix in case section keys don't align
+        if (!mult) {
+          const entry = Object.entries(diameterMultipliersMap).find(([k]) => k.endsWith(`:${diaOptionId}`));
+          if (entry) {
+            mult = entry[1];
+          }
+        }
+        if (mult) return mult;
+        // Final fallback: direct option-id lookup
+        const byOptMult = multByOptionId[diaOptionId];
+        if (byOptMult) {
+          return byOptMult;
+        }
+      }
+    }
+    return 1;
+  }
+
+  
   const [showRequiredHint, setShowRequiredHint] = useState<boolean>(false);
+
+  // When active cart item changes, restore UI selections for dynamic sections
+  useEffect(() => {
+    if (!activeItemId) {
+      // clear selections when no active item
+      setDynamicSections(prev => prev.map(ds => ({ ...ds, selectedId: null })));
+      return;
+    }
+    // Use cartRef to avoid adding `cart` to deps and creating a feedback loop
+    const item = cartRef.current.find(it => it.id === activeItemId);
+    if (!item) return;
+    // Map stored selection names back to option ids for each dynamic section
+    setDynamicSections(prev => prev.map(ds => {
+      const selName = item.dynamicSelections?.[ds.key];
+      if (!selName) return { ...ds, selectedId: null };
+      const found = ds.options.find(o => o.name === selName);
+      return { ...ds, selectedId: found ? found.id : null };
+    }));
+
+  }, [activeItemId]);
 
   // Vypočet celkovej ceny
   // totalPrice (global) no longer used; item totals computed per cart item
 
   useEffect(() => {
-    loadAllSections();
-    loadAdminEmails();
+    async function init() {
+        const sections = await loadAllSections();
+        await loadDiameterMultipliers(sections);
+        await loadRecipes();
+        await loadAdminEmails();
+    }
+    init();
 
     // Live updates: subscribe to changes on section_meta and section_options
     const channel = supabase.channel('sections-live')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'section_meta' }, () => {
-        loadAllSections();
+        loadAllSections().then(secs => loadDiameterMultipliers(secs as any).catch(() => {}));
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'section_options' }, () => {
-        loadAllSections();
+        loadAllSections().then(secs => loadDiameterMultipliers(secs as any).catch(() => {}));
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'diameter_multipliers' }, () => {
+        loadDiameterMultipliers();
       })
       .subscribe();
 
@@ -85,6 +166,83 @@ export function HomePage() {
     };
   }, []);
 
+  async function loadDiameterMultipliers(sectionsParam?: DynamicSectionData[]) {
+    try {
+      const { data, error } = await supabase
+        .from('diameter_multipliers')
+        .select('section_key, option_id, multiplier');
+      if (error) throw error;
+      const map: Record<string, number> = {};
+      // Remap DB section_key to the `dynamicSections` keys where possible.
+      const knownKeys = new Map<string,string>();
+      const sectionsToUse = sectionsParam || dynamicSections;
+      sectionsToUse.forEach(ds => knownKeys.set(ds.key.toLowerCase(), ds.key));
+
+      // small helper: levenshtein distance for fuzzy matching (for typos like 'primer' vs 'priemer')
+      function levenshtein(a: string, b: string) {
+        const al = a.length, bl = b.length;
+        if (al === 0) return bl;
+        if (bl === 0) return al;
+        const dp = Array.from({ length: al + 1 }, () => new Array(bl + 1).fill(0));
+        for (let i = 0; i <= al; i++) dp[i][0] = i;
+        for (let j = 0; j <= bl; j++) dp[0][j] = j;
+        for (let i = 1; i <= al; i++) {
+          for (let j = 1; j <= bl; j++) {
+            const cost = a[i-1] === b[j-1] ? 0 : 1;
+            dp[i][j] = Math.min(dp[i-1][j] + 1, dp[i][j-1] + 1, dp[i-1][j-1] + cost);
+          }
+        }
+        return dp[al][bl];
+      }
+      (data || []).forEach((r: any) => {
+        if (r?.section_key && r?.option_id) {
+          const rawKey = String(r.section_key || '').trim();
+          const normalized = rawKey.toLowerCase();
+          let useKey = knownKeys.get(normalized) || rawKey;
+          if (!knownKeys.has(normalized)) {
+            // fuzzy find closest known key
+            let best: string | null = null;
+            let bestScore = Infinity;
+            for (const k of knownKeys.keys()) {
+              const score = levenshtein(k, normalized);
+              if (score < bestScore) { bestScore = score; best = k; }
+            }
+            if (best && bestScore <= 2) {
+              useKey = knownKeys.get(best) || rawKey;
+              
+            }
+          }
+          const mapKey = `${useKey}:${r.option_id}`;
+          map[mapKey] = r.multiplier ?? 1;
+          if (useKey !== rawKey) {
+            
+          }
+        }
+      });
+      setDiameterMultipliersMap(map);
+      // also set direct map by option id for reliable lookup
+      const byOpt: Record<string, number> = {};
+      (data || []).forEach((r: any) => { if (r?.option_id) byOpt[String(r.option_id)] = r.multiplier ?? 1; });
+      setMultByOptionId(byOpt);
+      
+    } catch (err) {
+      console.error('Load diameter multipliers failed:', err);
+    }
+  }
+
+  async function loadRecipes() {
+    try {
+      const { data, error } = await supabase.from('recipes').select('id, name');
+      if (error) throw error;
+      const map: Record<string,string> = {};
+      (data || []).forEach((r: any) => { if (r?.name) map[String(r.name)] = r.id; });
+      setRecipesByName(map);
+      
+    } catch (e) {
+      console.error('loadRecipes failed', e);
+    }
+  }
+
   async function loadAllSections() {
     try {
       const { data, error } = await supabase
@@ -98,19 +256,17 @@ export function HomePage() {
       const opts = data || [];
 
       // Fetch bottom descriptions from section_meta
+      // Try to read sort_order when available
       let meta: any[] | null = null;
-      let metaErr: any = null;
-      {
+      try {
         const tmp = await supabase
           .from('section_meta')
-          .select('section, description, required');
+          .select('section, description, required, sort_order');
         meta = tmp.data as any[] | null;
-        metaErr = tmp.error;
-      }
-      if (metaErr) {
+      } catch (e) {
         const fallback = await supabase
           .from('section_meta')
-          .select('section, description');
+          .select('section, description, required');
         if (fallback.error) throw fallback.error;
         meta = (fallback.data as any[] | null) || [];
       }
@@ -132,10 +288,53 @@ export function HomePage() {
       // Postav VŠETKY dynamické sekcie zo zjednotenia kľúčov (meta + options), VRÁTANE logistics
       const keysFromMeta = Object.keys(descMap);
       const keysFromOpts = [...new Set(opts.map(o => o.section))];
-      const unionKeys = Array.from(new Set([...keysFromMeta, ...keysFromOpts]));
+      let unionKeys = Array.from(new Set([...keysFromMeta, ...keysFromOpts]));
+
+      // If meta contains sort_order values, prefer that ordering
+      const sortOrderMap: Record<string, number> = {};
+      (meta || []).forEach((m: any) => {
+        if (m?.section && typeof m.sort_order !== 'undefined' && m.sort_order !== null) {
+          sortOrderMap[m.section] = Number(m.sort_order) || 0;
+        }
+      });
+      if (Object.keys(sortOrderMap).length > 0) {
+        unionKeys = unionKeys.sort((a, b) => {
+          const aVal = typeof sortOrderMap[a] !== 'undefined' ? sortOrderMap[a] : 99999;
+          const bVal = typeof sortOrderMap[b] !== 'undefined' ? sortOrderMap[b] : 99999;
+          if (aVal !== bVal) return aVal - bVal;
+          return a.localeCompare(b, 'sk', { sensitivity: 'base' });
+        });
+      } else {
+        // If DB has no sort_order, check for localStorage fallback written by AdminPanel
+        try {
+          if (typeof window !== 'undefined' && window.localStorage) {
+            const stored = window.localStorage.getItem('upec_section_order');
+            if (stored) {
+              const arr = JSON.parse(stored);
+              if (Array.isArray(arr) && arr.length) {
+                // Keep only keys that exist now, preserve order from stored array
+                const filtered = arr.filter((k: string) => unionKeys.includes(k));
+                // Append any new keys not in stored array
+                const remaining = unionKeys.filter(k => !filtered.includes(k));
+                unionKeys = [...filtered, ...remaining];
+              }
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
 
       const dynamicSectionsData: DynamicSectionData[] = unionKeys.map(key => {
-        const sectionOpts = opts.filter(o => o.section === key);
+        const sectionOpts = opts.filter(o => o.section === key).map((o: any) => ({
+          id: o.id,
+          section: o.section,
+          name: o.name,
+          price: Number(o.price) || 0,
+          description: o.description || null,
+          sort_order: o.sort_order || 0,
+          linkedRecipeId: o.linked_recipe_id || o.linkedRecipeId || null,
+        }));
         const defaultLabel = key.split('_').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
         const metaDesc = descMap[key];
         const label = (!isPlaceholder(metaDesc)) ? metaDesc : defaultLabel;
@@ -149,15 +348,16 @@ export function HomePage() {
           required: Boolean(reqMap[key]),
         };
       });
-      // Ensure uniqueness and stable sort
+      // Ensure uniqueness while preserving the ordering determined above (DB sort_order or localStorage fallback)
       const uniqByKey = Array.from(new Map(dynamicSectionsData.map(ds => [ds.key, ds])).values());
-      const sorted = uniqByKey.sort((a, b) => a.label.localeCompare(b.label, 'sk', { sensitivity: 'base' }));
-      setDynamicSections(sorted);
+      setDynamicSections(uniqByKey);
+      return uniqByKey;
     } catch (err) {
       console.error('Chyba pri načítaní sekcií:', err);
     } finally {
       setLoading(false);
     }
+    return [];
   }
 
   async function loadAdminEmails() {
@@ -165,35 +365,159 @@ export function HomePage() {
     return;
   }
 
+  // Remove cart items that are empty (no dynamic selections). Keep the optional exceptId.
+  function pruneEmptyCartItems(exceptId?: string) {
+    setCart(prev => {
+      const filtered = prev.filter(it => {
+        if (exceptId && it.id === exceptId) return true;
+        const keys = Object.keys(it.dynamicSelections || {});
+        return keys.length > 0;
+      });
+      return filtered;
+    });
+  }
+
+  // Note: recipes are not required here; diameter-managed sections are detected from
+  // `diameter_multipliers` entries loaded into `diameterMultipliersMap`.
+
   // Selection handlers with price updates
   // Legacy selection handlers removed; dynamic sections use upsertCartDynamic
 
   function onSelectDynamic(key: string, optionId: string) {
-    setDynamicSections(prev =>
-      prev.map(ds => (ds.key === key ? { ...ds, selectedId: optionId } : ds))
-    );
-    setShowRequiredHint(false);
-    const section = dynamicSections.find(ds => ds.key === key);
+    // Build the new dynamicSections array synchronously so we can use it for immediate total computation
+    const newDynamicSections = dynamicSections.map(ds => ds.key === key ? { ...ds, selectedId: optionId } : ds);
+    setDynamicSections(newDynamicSections);
+    
+    const section = newDynamicSections.find(ds => ds.key === key);
     const opt = section?.options.find(o => o.id === optionId);
+    
     if (opt) {
-      upsertCartDynamic(key, opt.name);
+      upsertCartDynamic(key, opt.name, newDynamicSections);
+      // Recompute all cart items immediately using updated sections (ensures multipliers apply right away)
+      setCart(prev => prev.map(it => ({ ...it, totalPrice: computeItemTotalWithSections(it, newDynamicSections) })));
     }
+    
+    // Nezmeň showRequiredHint — nech zvýraznenie zostane aktívne, kým nie sú vyplnené všetky povinné polia
   }
 
   function computeItemTotal(it: CartItem) {
-    let sum = 0;
+    // Compute total where only selections from sections present in
+    // `diameterMultipliersMap` are scaled. Other selections remain unscaled.
+    let total = 0;
+
     for (const [secKey, name] of Object.entries(it.dynamicSelections || {})) {
       const ds = dynamicSections.find(d => d.key === secKey);
       if (!ds) continue;
       const opt = ds.options.find(o => o.name === name);
-      sum += opt?.price ?? 0;
+      const price = opt?.price ?? 0;
+
+      // Determine multiplier to apply for recipe-linked options.
+      // Prefer per-item selection of a managed diameter section, else fall back
+      // to the globally selected diameter multiplier for that section.
+      let appliedMult = 1;
+      const isLinked = Boolean(opt?.linkedRecipeId || recipesByName[opt?.name || '']);
+      if (isLinked) {
+        // Look for any managed section that has a selection on this cart item
+        const managed = Array.from(new Set(Object.keys(diameterMultipliersMap).map(k => k.split(':')[0])));
+        for (const m of managed) {
+          // If this cart item has a selection for the managed section, use it
+          const itemSelName = it.dynamicSelections?.[m];
+          let diaOptionId: string | undefined;
+          if (itemSelName) {
+            const sec = dynamicSections.find(d => d.key === m);
+            diaOptionId = sec?.options.find(op => op.name === itemSelName)?.id;
+          }
+          // Otherwise, use global selected id from dynamicSections
+          if (!diaOptionId) {
+            diaOptionId = dynamicSections.find(d => d.key === m)?.selectedId || undefined;
+          }
+          if (diaOptionId) {
+            let mult = diameterMultipliersMap[`${m}:${diaOptionId}`];
+            if (!mult) {
+              const entry = Object.entries(diameterMultipliersMap).find(([k]) => k.endsWith(`:${diaOptionId}`));
+              if (entry) { mult = entry[1]; }
+            }
+            // final fallback by option id
+            if (!mult) {
+              const byOptMult = multByOptionId[diaOptionId];
+              if (byOptMult) { mult = byOptMult; }
+            }
+            if (mult) { appliedMult = mult; break; }
+          }
+        }
+      }
+
+      // If option is recipe-linked but no multiplier was found, nothing to do
+
+      total += price * appliedMult;
     }
-    return sum + (it.reward || 0);
+
+    return total + (it.reward || 0);
   }
+
+  // Recompute cart totals whenever multipliers or sections change
+  useEffect(() => {
+    // Recompute totals when multipliers or sections change
+    if (!cart || cart.length === 0) return;
+    setCart(prev => prev.map(it => ({ ...it, totalPrice: computeItemTotal(it) })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diameterMultipliersMap, dynamicSections]);
 
   // addCake is no longer used directly; '+ ďalšia torta' starts a fresh item
 
-  function upsertCartDynamic(sectionKey: string, optionName: string) {
+  function computeItemTotalWithSections(it: CartItem, sections: DynamicSectionData[]) {
+    let total = 0;
+    for (const [secKey, name] of Object.entries(it.dynamicSelections || {})) {
+      const ds = sections.find(d => d.key === secKey);
+      if (!ds) continue;
+      const opt = ds.options.find(o => o.name === name);
+      if (!opt) continue;
+      let price = opt.price || 0;
+      const isLinked = Boolean(opt.linkedRecipeId || recipesByName[opt?.name || '']);
+      if (isLinked) {
+        // Determine applicable multiplier using provided sections (prefer item-level selection)
+        let appliedMult = 1;
+        const managed = Array.from(new Set(Object.keys(diameterMultipliersMap).map(k => k.split(':')[0])));
+        for (const m of managed) {
+          if (m === secKey) continue;
+          // item-level selection takes precedence
+          let diaOptionId: string | undefined;
+          const itemSelName = it.dynamicSelections?.[m];
+          if (itemSelName) {
+            const sec = sections.find(d => d.key === m);
+            diaOptionId = sec?.options.find(op => op.name === itemSelName)?.id;
+          }
+          if (!diaOptionId) diaOptionId = sections.find(d => d.key === m)?.selectedId || undefined;
+          if (diaOptionId) {
+            let mult = diameterMultipliersMap[`${m}:${diaOptionId}`];
+            if (!mult) {
+              const entry = Object.entries(diameterMultipliersMap).find(([k]) => k.endsWith(`:${diaOptionId}`));
+              if (entry) { mult = entry[1]; }
+            }
+            // final fallback by option id
+            if (!mult) {
+              const byOptMult = multByOptionId[diaOptionId];
+              if (byOptMult) { mult = byOptMult; }
+            }
+            if (mult) { appliedMult = mult; break; }
+          }
+        }
+        // Debugging: log when a linked option is processed and either a multiplier applied or missing
+        if (appliedMult === 1) {
+          try {
+          
+          } catch (e) { /* ignore */ }
+        } else {
+          
+        }
+        price = price * appliedMult;
+      }
+      total += price;
+    }
+    return total + (it.reward || 0);
+  }
+
+  function upsertCartDynamic(sectionKey: string, optionName: string, sectionsForCompute?: DynamicSectionData[]) {
     setCart(prev => {
       // ensure target item
       let targetId = activeItemId;
@@ -218,7 +542,8 @@ export function HomePage() {
         const copy: CartItem = { ...it };
         copy.dynamicSelections = { ...(copy.dynamicSelections || {}) };
         copy.dynamicSelections[sectionKey] = optionName || '';
-        copy.totalPrice = computeItemTotal(copy);
+        const sectionsRef = sectionsForCompute || dynamicSections;
+        copy.totalPrice = computeItemTotalWithSections(copy, sectionsRef);
         return copy;
       });
       return next;
@@ -226,12 +551,15 @@ export function HomePage() {
   }
 
   function removeDynamicPart(itemId: string, sectionKey: string) {
+    // Build updated dynamicSections reflecting the UI change so total computation is accurate
+    const updatedSections = dynamicSections.map(ds => ds.key === sectionKey ? { ...ds, selectedId: null } : ds);
+    setDynamicSections(updatedSections);
     setCart(prev => {
       const updated = prev.map(it => {
         if (it.id !== itemId) return it;
         const copy: CartItem = { ...it };
         if (copy.dynamicSelections) delete copy.dynamicSelections[sectionKey];
-        copy.totalPrice = computeItemTotal(copy);
+        copy.totalPrice = computeItemTotalWithSections(copy, updatedSections);
         return copy;
       });
       const cleaned = updated.filter(it => {
@@ -243,8 +571,7 @@ export function HomePage() {
       }
       return cleaned;
     });
-    // Reset UI selection for the removed dynamic section
-    setDynamicSections(prev => prev.map(ds => ds.key === sectionKey ? { ...ds, selectedId: null } : ds));
+    // UI selection already updated above
   }
 
   async function handleCheckoutWithData(name: string, email: string) {
@@ -270,6 +597,8 @@ export function HomePage() {
       lineTotal: it.totalPrice * it.quantity,
     }));
     try {
+      setOrderSuccess(false);
+      setIsSubmittingOrder(true);
       // Uložiť objednávku do DB
       const { error } = await supabase
         .from('orders')
@@ -290,34 +619,43 @@ export function HomePage() {
         lineTotal: it.lineTotal,
       }));
 
-      console.log('Calling Edge Function with:', { customerEmail: email, customerName: name, items: emailItems, total });
+      // Generate PDF for email attachment (does not change Export-to-PDF UX)
+      let pdfBase64: string | null = null;
+      let pdfFilename: string | null = null;
+      try {
+        pdfBase64 = await generatePdfBase64ForEmail();
+        if (pdfBase64) {
+          pdfFilename = `order-${Date.now()}.pdf`;
+        }
+      } catch (pe) {
+        pdfBase64 = null;
+        pdfFilename = null;
+      }
 
-      const { data: fnData, error: fnError } = await supabase.functions.invoke('send-order-email', {
+      const { error: fnError } = await supabase.functions.invoke('send-order-email', {
         body: {
           customerEmail: email,
           customerName: name,
           items: emailItems,
           total,
+          pdfBase64,
+          pdfFilename,
         },
       });
 
-      console.log('Edge Function response:', { fnData, fnError });
-
       if (fnError) {
-        console.error('Edge Function error:', fnError);
         alert(`Objednávka bola uložená, ale email sa nepodarilo odoslať: ${fnError.message}`);
-      } else {
-        console.log('Emails sent successfully:', fnData);
       }
-
+      setIsSubmittingOrder(false);
+      setOrderSuccess(true);
       setIsEmailModalOpen(false);
       setCart([]);
       setIsCartOpen(false);
-      alert('Ďakujeme! Objednávka bola uložená a potvrdenie bolo odoslané na email.');
     } catch (e) {
       console.error('Supabase insert error:', e);
       const msg = (e as any)?.message || (e as any)?.error || 'Nepodarilo sa uložiť objednávku.';
       alert(msg);
+      setIsSubmittingOrder(false);
     }
   }
 
@@ -428,11 +766,19 @@ export function HomePage() {
         doc.text(item.eventName, pageWidth - 20, y, { align: 'right' });
         y += 10;
 
-        // Details with prices per component (all dynamic)
+        // Details with prices per component (apply diameter multipliers for recipe-linked options)
         const details = Object.entries(item.dynamicSelections || {}).map(([secKey, name]) => {
           const ds = dynamicSections.find(d => d.key === secKey);
           const label = (ds?.label || secKey.split('_').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')) + ':';
-          return { label, value: name, price: getP(secKey, name) };
+          const basePrice = getP(secKey, name);
+          const opt = ds?.options.find(o => o.name === name);
+          const isLinked = Boolean(opt?.linkedRecipeId || recipesByName[opt?.name || '']);
+          let price = basePrice;
+          if (isLinked) {
+            const appliedMult = findApplicableDiameterMultiplier(secKey, item) || 1;
+            price = basePrice * appliedMult;
+          }
+          return { label, value: name, price };
         });
         if (item.reward > 0) {
           details.push({ label: 'Odmena pre tvorcu:', value: '', price: item.reward });
@@ -494,6 +840,154 @@ export function HomePage() {
     }
   }
 
+  // Generate PDF as base64 for attaching to emails during checkout.
+  async function generatePdfBase64ForEmail() {
+    if (cart.length === 0) return null;
+    try {
+      const doc = new jsPDF();
+      const pageWidth = doc.internal.pageSize.width;
+
+      // reuse same font logic as exportCartToPDF to preserve appearance
+      async function ensureFont() {
+        const localPath = '/fonts/DejaVuSans.ttf';
+        const localBoldPath = '/fonts/DejaVuSans-Bold.ttf';
+        const tryLoad = async (url: string, vfsName: string, fontName: string) => {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const buf = await res.arrayBuffer();
+          let binary = '';
+          const bytes = new Uint8Array(buf);
+          const chunk = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunk) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk) as any);
+          }
+          doc.addFileToVFS(vfsName, binary);
+          try { (doc as any).addFont(vfsName, fontName, 'normal', 'Identity-H'); } catch (_) { doc.addFont(vfsName, fontName, 'normal'); }
+          doc.setFont(fontName, 'normal');
+          return fontName;
+        };
+        const tryLoadBold = async (url: string, vfsName: string, fontName: string) => {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const buf = await res.arrayBuffer();
+          let binary = '';
+          const bytes = new Uint8Array(buf);
+          const chunk = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunk) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk) as any);
+          }
+          doc.addFileToVFS(vfsName, binary);
+          try { (doc as any).addFont(vfsName, fontName, 'bold', 'Identity-H'); } catch (_) { doc.addFont(vfsName, fontName, 'bold'); }
+        };
+        try {
+          const name = await tryLoad(localPath, 'dejavu.ttf', 'dejavu');
+          try { await tryLoadBold(localBoldPath, 'dejavu-bold.ttf', 'dejavu'); } catch {}
+          return name;
+        } catch (e) {
+          console.warn('Local DejaVuSans.ttf not found, falling back to CDN NotoSans.', e);
+        }
+        try {
+          const name = await tryLoad('https://cdn.jsdelivr.net/gh/google/fonts/ofl/notosans/NotoSans-Regular.ttf', 'notosans.ttf', 'notosans');
+          return name;
+        } catch (e2) {
+          console.warn('NotoSans fallback zlyhal, použije sa helvetica.', e2);
+          doc.setFont('helvetica', 'normal');
+          return 'helvetica';
+        }
+      }
+
+      const activeFont = await ensureFont();
+
+      // Header
+      doc.setFillColor(255, 200, 214);
+      doc.rect(0, 0, pageWidth, 40, 'F');
+      doc.setTextColor(91, 17, 51);
+      doc.setFontSize(22);
+      if (activeFont !== 'helvetica') doc.setFont(activeFont, 'bold'); else doc.setFont('helvetica', 'bold');
+      doc.text('Tortová kalkulačka', pageWidth / 2, 18, { align: 'center' });
+      doc.setFontSize(12);
+      doc.setTextColor(120, 70, 90);
+      doc.text('Zhrnutie objednávky', pageWidth / 2, 28, { align: 'center' });
+
+      let y = 55;
+
+      const priceBy: Record<string, Map<string, number>> = {};
+      dynamicSections.forEach(ds => { priceBy[ds.key] = new Map(ds.options.map(o => [o.name, o.price])); });
+      const getP = (section: string, name?: string | null) => (name ? (priceBy[section]?.get(name) ?? 0) : 0);
+
+      cart.forEach((item, idx) => {
+        if (y > 250) { doc.addPage(); y = 25; }
+        doc.setFillColor(240, 247, 255);
+        doc.rect(15, y - 8, pageWidth - 30, 14, 'F');
+        doc.setTextColor(0, 86, 179);
+        doc.setFontSize(13);
+        doc.text('Tvoja dokonalá torta', 20, y);
+        doc.setTextColor(100, 100, 100);
+        doc.setFontSize(10);
+        doc.text(item.eventName, pageWidth - 20, y, { align: 'right' });
+        y += 10;
+
+        const details = Object.entries(item.dynamicSelections || {}).map(([secKey, name]) => {
+          const ds = dynamicSections.find(d => d.key === secKey);
+          const label = (ds?.label || secKey.split('_').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')) + ':';
+          const basePrice = getP(secKey, name);
+          const opt = ds?.options.find(o => o.name === name);
+          const isLinked = Boolean(opt?.linkedRecipeId || recipesByName[opt?.name || '']);
+          let price = basePrice;
+          if (isLinked) {
+            const appliedMult = findApplicableDiameterMultiplier(secKey, item) || 1;
+            price = basePrice * appliedMult;
+          }
+          return { label, value: name, price };
+        });
+        if (item.reward > 0) details.push({ label: 'Odmena pre tvorcu:', value: '', price: item.reward });
+
+        doc.setFontSize(9);
+        doc.setTextColor(50, 50, 50);
+        details.forEach(d => {
+          if (y > 270) { doc.addPage(); y = 25; }
+          doc.setFont(activeFont !== 'helvetica' ? activeFont : 'helvetica', 'normal');
+          doc.setTextColor(30, 30, 30);
+          doc.text(d.label, 25, y);
+          if (d.value) doc.text(d.value, 65, y);
+          doc.setFont(activeFont !== 'helvetica' ? activeFont : 'helvetica', 'bold');
+          doc.setTextColor(15, 90, 80);
+          doc.text(`${d.price.toFixed(2)} €`, pageWidth - 20, y, { align: 'right' });
+          y += 6;
+        });
+
+        y += 4;
+        if (idx < cart.length - 1) { doc.setDrawColor(220, 220, 220); doc.line(20, y, pageWidth - 20, y); y += 8; }
+      });
+
+      const grandTotal = cart.reduce((sum, it) => sum + (it.totalPrice * it.quantity), 0).toFixed(2);
+      if (y > 245) { doc.addPage(); y = 25; }
+      doc.setFillColor(255, 143, 177);
+      doc.rect(15, y, pageWidth - 30, 18, 'F');
+      doc.setFont(activeFont !== 'helvetica' ? activeFont : 'helvetica', 'bold');
+      doc.setFontSize(12);
+      doc.setTextColor(91, 17, 51);
+      doc.text('Spolu všetky položky:', 20, y + 12);
+      doc.setFontSize(14);
+      doc.text(`${grandTotal} €`, pageWidth - 20, y + 12, { align: 'right' });
+
+      const pageCount = doc.internal.pages.length - 1;
+      for (let i = 1; i <= pageCount; i++) {
+        doc.setPage(i);
+        doc.setFontSize(8);
+        doc.setTextColor(150, 150, 150);
+        doc.text(`Strana ${i} z ${pageCount}`, pageWidth / 2, doc.internal.pageSize.height - 10, { align: 'center' });
+      }
+
+      const dataUri = doc.output('datauristring');
+      const base64 = dataUri.split(',')[1];
+      return base64;
+    } catch (e) {
+      console.error('PDF generation for email failed', e);
+      return null;
+    }
+  }
+
   
 
   // duplicates removed
@@ -502,10 +996,30 @@ export function HomePage() {
 
   return (
     <>
+      <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+      {(isSubmittingOrder || orderSuccess) && (
+        <div style={styles.fullscreenOverlay}>
+          {isSubmittingOrder && !orderSuccess && (
+            <div style={styles.loaderBox}>
+              <div style={styles.loaderSpinner} />
+              <div style={styles.loaderText}>Odosielame objednávku…</div>
+            </div>
+          )}
+          {orderSuccess && (
+            <div style={styles.successBox}>
+              <div style={styles.successIcon}>✓</div>
+              <div style={styles.successTitle}>Objednávka bola odoslaná</div>
+              <div style={styles.successSubtitle}>Potvrdenie sme poslali na váš e‑mail.</div>
+              <button style={styles.successButton} onClick={() => setOrderSuccess(false)}>Zavrieť</button>
+            </div>
+          )}
+        </div>
+      )}
       <header style={styles.header}>
         <div style={styles.headerInner}>
           <h1 style={styles.title}>🎂 Tortová Kalkulačka</h1>
-          <button
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button
             onClick={() => setIsCartOpen(!isCartOpen)}
             onMouseDown={(e) => e.preventDefault()}
             style={styles.cartButton}
@@ -513,6 +1027,8 @@ export function HomePage() {
           >
             🛒 {cart.length > 0 && <span style={styles.cartBadge}>{cart.length}</span>}
           </button>
+          
+          </div>
         </div>
       </header>
 
@@ -566,8 +1082,17 @@ export function HomePage() {
                       <div style={styles.priceBox}>
                         {(() => {
                           const selectedOpt = dynSec.options.find(o => o.id === dynSec.selectedId);
-                          const price = selectedOpt?.price ?? null;
-                          return `${(price ?? 0).toFixed(2)} €`;
+                          let price = selectedOpt?.price ?? 0;
+                          const isLinkedForUI = Boolean(selectedOpt?.linkedRecipeId || recipesByName[selectedOpt?.name || '']);
+                          if (selectedOpt && isLinkedForUI) {
+                            const applied = findApplicableDiameterMultiplier(dynSec.key);
+                            price = price * (applied || 1);
+                          }
+                          return (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <span>{price.toFixed(2)} €</span>
+                            </div>
+                          );
                         })()}
                       </div>
                     </div>
@@ -598,9 +1123,11 @@ export function HomePage() {
                     <div
                       key={item.id}
                       onClick={() => {
-                        // Just set the active item; do not prune others
-                        setActiveItemId(item.id);
-                      }}
+                          // Before switching, remove any empty cart items (no selections),
+                          // but keep the one we're switching to.
+                          pruneEmptyCartItems(item.id);
+                          setActiveItemId(item.id);
+                        }}
                       style={{
                         display: 'flex',
                         flexDirection: 'column',
@@ -619,7 +1146,13 @@ export function HomePage() {
                         {item.dynamicSelections && Object.entries(item.dynamicSelections).map(([secKey, name]) => {
                           const dsec = dynamicSections.find(d => d.key === secKey);
                           const label = dsec?.label || secKey.split('_').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-                          const price = dsec?.options.find(o => o.name === name)?.price ?? 0;
+                          const opt = dsec?.options.find(o => o.name === name);
+                          const basePrice = opt?.price ?? 0;
+                          // Determine per-selection multiplier: prefer per-item diameter selection,
+                          // otherwise fall back to globally selected diameter multipliers.
+                          const isLinkedForUI = Boolean(opt?.linkedRecipeId || recipesByName[opt?.name || '']);
+                          const appliedMult = isLinkedForUI ? findApplicableDiameterMultiplier(secKey, item) : 1;
+                          const price = basePrice * appliedMult;
                           return (
                             <div key={`${item.id}-${secKey}`} style={styles.breakdownRow}>
                               <div style={styles.breakdownName}>{label}: {name}</div>
@@ -647,6 +1180,13 @@ export function HomePage() {
                       <button
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => {
+                          // Prevent adding a new cake if any existing cake is empty (no selections)
+                          const hasEmpty = cart.some(it => !(it.dynamicSelections && Object.values(it.dynamicSelections).some(Boolean)));
+                          if (hasEmpty) {
+                            // Show inline required hint instead of blocking alert
+                            setShowRequiredHint(true);
+                            return;
+                          }
                           if (!allHaveRequired) {
                             setShowRequiredHint(true);
                             return;
@@ -723,6 +1263,8 @@ export function HomePage() {
         </>
       )}
 
+      
+
       <EmailModal
         isOpen={isEmailModalOpen}
         onClose={() => setIsEmailModalOpen(false)}
@@ -733,6 +1275,86 @@ export function HomePage() {
 }
 
 const styles = {
+  fullscreenOverlay: {
+    position: 'fixed',
+    inset: 0,
+    background: 'rgba(255,255,255,0.9)',
+    zIndex: 3000,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backdropFilter: 'blur(2px)',
+  } as React.CSSProperties,
+  loaderBox: {
+    background: '#ffffff',
+    border: '1px solid #e5e7eb',
+    borderRadius: 12,
+    padding: '1.5rem 2rem',
+    boxShadow: '0 10px 30px rgba(0,0,0,0.08)',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: '0.75rem',
+  } as React.CSSProperties,
+  loaderSpinner: {
+    width: 42,
+    height: 42,
+    border: '4px solid #e5e7eb',
+    borderTopColor: '#5b8fd9',
+    borderRadius: '50%',
+    animation: 'spin 1s linear infinite',
+  } as React.CSSProperties,
+  loaderText: {
+    color: '#1f2937',
+    fontWeight: 600,
+    fontSize: '1rem',
+  } as React.CSSProperties,
+  successBox: {
+    background: '#ffffff',
+    border: '1px solid #e5e7eb',
+    borderRadius: 14,
+    padding: '1.75rem 2.25rem',
+    boxShadow: '0 12px 32px rgba(0,0,0,0.08)',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: '0.5rem',
+    textAlign: 'center' as const,
+    maxWidth: 360,
+  } as React.CSSProperties,
+  successIcon: {
+    width: 56,
+    height: 56,
+    borderRadius: '50%',
+    background: '#dcfce7',
+    color: '#15803d',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: 28,
+    fontWeight: 700,
+  } as React.CSSProperties,
+  successTitle: {
+    fontSize: '1.1rem',
+    fontWeight: 700,
+    color: '#111827',
+  } as React.CSSProperties,
+  successSubtitle: {
+    fontSize: '0.95rem',
+    color: '#374151',
+    lineHeight: 1.5,
+  } as React.CSSProperties,
+  successButton: {
+    marginTop: '0.75rem',
+    background: '#5b8fd9',
+    border: '1px solid #4e7ec2',
+    color: '#fff',
+    borderRadius: 10,
+    padding: '0.65rem 1.2rem',
+    cursor: 'pointer',
+    fontWeight: 700,
+    boxShadow: '0 6px 16px rgba(91,143,217,0.28)',
+  } as React.CSSProperties,
   container: {
     minHeight: '100vh',
     backgroundColor: '#ffffff',
@@ -854,17 +1476,29 @@ const styles = {
   priceBox: {
     background: '#f1f7ff',
     color: '#0056b3',
-    padding: '0.5rem 0.75rem',
-    borderRadius: 8,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '0.28rem 0.6rem',
+    borderRadius: 6,
     border: '1px solid #e0eefc',
-    minWidth: 80,
+    minWidth: 72,
     textAlign: 'center' as const,
+    fontSize: '0.95rem',
+    height: '2rem',
+    lineHeight: '2rem',
   } as React.CSSProperties,
   priceBoxSmall: {
     color: '#5b6b7a',
-    fontSize: '0.9rem',
-    minWidth: 100,
+    fontSize: '0.85rem',
+    minWidth: 78,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '0.18rem 0.5rem',
     textAlign: 'center' as const,
+    height: '2rem',
+    lineHeight: '2rem',
   } as React.CSSProperties,
   detailBox: {
     marginTop: '0.75rem',

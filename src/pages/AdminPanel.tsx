@@ -93,12 +93,6 @@ export function AdminPanel() {
   const [userBakeryId, setUserBakeryId] = useState<string | null>(null);
   const [userBakeryName, setUserBakeryName] = useState<string | null>(null);
   const [userBakerySlug, setUserBakerySlug] = useState<string | null>(null);
-  const [noBakeryFound, setNoBakeryFound] = useState(false);
-  const [setupBakeryName, setSetupBakeryName] = useState('');
-  const [setupSlug, setSetupSlug] = useState('');
-  const [setupSlugEdited, setSetupSlugEdited] = useState(false);
-  const [setupLoading, setSetupLoading] = useState(false);
-  const [setupError, setSetupError] = useState('');
   // Internal mapping: DB key -> display label (built from DB on load)
   const [keyToLabel, setKeyToLabel] = useState<Record<string, string>>({});
   
@@ -391,45 +385,10 @@ export function AdminPanel() {
     } catch {
       // ticho — migrácia ešte nebola spustená
     }
-    if (!resolvedBakeryId) {
-      setNoBakeryFound(true);
-      return;
-    }
     loadFromDb(resolvedBakeryId);
     loadVisitStats(resolvedBakeryId);
     loadIngredients(resolvedBakeryId);
     loadRecipes(resolvedBakeryId);
-  }
-
-  const setupSlugify = (s: string) =>
-    s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-
-  async function handleNoBakerySetup(e: React.FormEvent) {
-    e.preventDefault();
-    setSetupError('');
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(setupSlug) || setupSlug.length < 2) {
-      setSetupError('Slug musí mať aspoň 2 znaky a môže obsahovať iba malé písmená, číslice a pomlčky.');
-      return;
-    }
-    if (!user?.id) { setSetupError('Nie ste prihlásený.'); return; }
-    setSetupLoading(true);
-    const { data: fnData, error: fnError } = await supabase.functions.invoke('register-bakery', {
-      body: { bakeryName: setupBakeryName, slug: setupSlug, email: user.email, userId: user.id },
-    });
-    if (fnError || fnData?.error) {
-      const msg = fnData?.error ?? fnError?.message ?? 'Neznáma chyba';
-      if (String(msg).includes('obsadený') || String(msg).includes('409')) {
-        setSetupError('Tento odkaz je už obsadený. Zvoľte iný.');
-      } else {
-        setSetupError(String(msg));
-      }
-      setSetupLoading(false);
-      return;
-    }
-    // Success — reload everything
-    setNoBakeryFound(false);
-    setSetupLoading(false);
-    window.location.reload();
   }
 
   async function checkSession() {
@@ -2030,69 +1989,6 @@ export function AdminPanel() {
 
   if (loading) {
     return <div style={{ padding: '2rem', textAlign: 'center' }}>Načítavam...</div>;
-  }
-
-  if (user && noBakeryFound) {
-    return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#edeaea' }}>
-        <div style={{ background: '#fff', borderRadius: '16px', boxShadow: '0 8px 32px rgba(0,0,0,0.12)', padding: '2.5rem', minWidth: 380, maxWidth: 440, width: '100%' }}>
-          <h1 style={{ textAlign: 'center', color: '#ff9fc4', fontWeight: 700, fontSize: '1.8rem', marginBottom: '0.4rem', fontFamily: "'Dancing Script', cursive" }}>Nastavte cukráreň</h1>
-          <p style={{ textAlign: 'center', color: '#888', fontSize: '0.95rem', marginBottom: '1.8rem' }}>
-            Váš účet nemá priradenú cukráreň. Vyplňte údaje nižšie.
-          </p>
-          {setupError && (
-            <div style={{ background: '#fef2f2', color: '#dc2626', padding: '10px 14px', borderRadius: '10px', fontSize: '0.9rem', marginBottom: '16px', border: '1px solid #fecaca' }}>
-              {setupError}
-            </div>
-          )}
-          <form onSubmit={handleNoBakerySetup} style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-              <label style={{ fontWeight: 600, fontSize: '0.9rem', color: '#374151' }}>Názov cukrárne</label>
-              <input
-                type="text"
-                value={setupBakeryName}
-                onChange={e => {
-                  setSetupBakeryName(e.target.value);
-                  if (!setupSlugEdited) setSetupSlug(setupSlugify(e.target.value));
-                }}
-                placeholder="napr. Sladký Sen"
-                required
-                style={{ padding: '0.75rem 1rem', borderRadius: '10px', border: '1.5px solid #e4e4e7', fontSize: '1rem', outline: 'none', fontFamily: 'inherit' }}
-              />
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-              <label style={{ fontWeight: 600, fontSize: '0.9rem', color: '#374151' }}>Odkaz na vašu stránku</label>
-              <input
-                type="text"
-                value={setupSlug}
-                onChange={e => { setSetupSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '')); setSetupSlugEdited(true); }}
-                placeholder="sladky-sen"
-                required
-                minLength={2}
-                autoComplete="off"
-                style={{ padding: '0.75rem 1rem', borderRadius: '10px', border: '1.5px solid #e4e4e7', fontSize: '1rem', outline: 'none', fontFamily: 'inherit' }}
-              />
-              <span style={{ fontSize: '0.82rem', color: '#9ca3af' }}>
-                upecsitortu.sk/<strong style={{ color: '#7c3aed' }}>{setupSlug || 'vas-odkaz'}</strong>
-              </span>
-            </div>
-            <button
-              type="submit"
-              disabled={setupLoading}
-              style={{ marginTop: '8px', padding: '14px', background: 'linear-gradient(135deg,#6c3ce0,#8b5cf6)', color: '#fff', border: 'none', borderRadius: '12px', fontSize: '1rem', fontWeight: 700, cursor: setupLoading ? 'not-allowed' : 'pointer', opacity: setupLoading ? 0.7 : 1 }}
-            >
-              {setupLoading ? 'Ukladám…' : 'Dokončiť nastavenie'}
-            </button>
-          </form>
-          <button
-            onClick={handleLogout}
-            style={{ marginTop: '1rem', background: 'transparent', border: 'none', color: '#9ca3af', fontSize: '0.9rem', cursor: 'pointer', width: '100%', textAlign: 'center' }}
-          >
-            Odhlásiť sa
-          </button>
-        </div>
-      </div>
-    );
   }
 
   if (isPasswordRecovery) {

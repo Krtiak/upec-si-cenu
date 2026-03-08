@@ -1,0 +1,103 @@
+# Page snapshot
+
+```yaml
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e4]:
+      - heading "🎂 Tortová Kalkulačka" [level=1] [ref=e5]
+      - button "🛒 1" [ref=e6] [cursor=pointer]:
+        - text: 🛒
+        - generic [ref=e7]: "1"
+  - generic [ref=e8]:
+    - generic [ref=e9]:
+      - generic [ref=e10]:
+        - heading "Priemer *" [level=2] [ref=e11]
+        - button "▾" [expanded] [ref=e12] [cursor=pointer]
+      - generic [ref=e13]: Priemer
+      - generic [ref=e15]:
+        - combobox [ref=e16] [cursor=pointer]:
+          - option "15 cm"
+          - option "18 cm" [selected]
+          - option "26 cm"
+        - generic [ref=e19]: 0.00 €
+    - generic [ref=e20]:
+      - generic [ref=e21]:
+        - heading "Piškótový Korpus" [level=2] [ref=e22]
+        - button "▾" [expanded] [ref=e23] [cursor=pointer]
+      - generic [ref=e24]: Piškótový Korpus
+      - generic [ref=e26]:
+        - combobox [ref=e27] [cursor=pointer]:
+          - option "Korpus" [selected]
+        - generic [ref=e30]: 2.25 €
+    - generic [ref=e31]:
+      - generic [ref=e32]:
+        - heading "Obterový Krém *" [level=2] [ref=e33]
+        - button "▾" [expanded] [ref=e34] [cursor=pointer]
+      - generic [ref=e35]: Obterový Krém
+      - generic [ref=e37]:
+        - combobox [ref=e38] [cursor=pointer]:
+          - option "Vanilkový Krém" [selected]
+        - generic [ref=e41]: 15.72 €
+    - generic [ref=e42]:
+      - generic [ref=e43]:
+        - heading "Plnkový Krém *" [level=2] [ref=e44]
+        - button "▾" [expanded] [ref=e45] [cursor=pointer]
+      - generic [ref=e46]: Plnkový Krém
+      - generic [ref=e48]:
+        - combobox [ref=e49] [cursor=pointer]:
+          - option "Čokoládový Krém" [selected]
+        - generic [ref=e52]: 5.38 €
+    - generic [ref=e53]:
+      - generic [ref=e54]:
+        - heading "Ovocná Zložka *" [level=2] [ref=e55]
+        - button "▾" [expanded] [ref=e56] [cursor=pointer]
+      - generic [ref=e57]: Ovocná Zložka
+      - generic [ref=e59]:
+        - combobox [ref=e60] [cursor=pointer]:
+          - option "Ovocná Zložka" [selected]
+        - generic [ref=e63]: 5.83 €
+    - generic [ref=e64]:
+      - generic [ref=e65]:
+        - heading "Krabica a Podložka *" [level=2] [ref=e66]
+        - button "▾" [expanded] [ref=e67] [cursor=pointer]
+      - generic [ref=e68]: Krabica a Podložka
+      - generic [ref=e70]:
+        - combobox [ref=e71] [cursor=pointer]:
+          - option "Krabica a Podložka" [selected]
+        - generic [ref=e74]: 1.00 €
+  - generic [ref=e75]:
+    - generic [ref=e76]:
+      - heading "Košík (1)" [level=2] [ref=e77]
+      - button "✕" [ref=e79] [cursor=pointer]
+    - generic [ref=e81]:
+      - generic [ref=e82] [cursor=pointer]:
+        - generic [ref=e83]:
+          - generic [ref=e84]:
+            - generic [ref=e85]: "Priemer: 18 cm"
+            - generic [ref=e86]: 0.00 €
+            - button "✕" [ref=e87]
+          - generic [ref=e88]:
+            - generic [ref=e89]: "Piškótový Korpus: Korpus"
+            - generic [ref=e90]: 2.25 €
+            - button "✕" [ref=e91]
+          - generic [ref=e92]:
+            - generic [ref=e93]: "Obterový Krém: Vanilkový Krém"
+            - generic [ref=e94]: 15.72 €
+            - button "✕" [ref=e95]
+          - generic [ref=e96]:
+            - generic [ref=e97]: "Plnkový Krém: Čokoládový Krém"
+            - generic [ref=e98]: 5.38 €
+            - button "✕" [ref=e99]
+          - generic [ref=e100]:
+            - generic [ref=e101]: "Ovocná Zložka: Ovocná Zložka"
+            - generic [ref=e102]: 5.83 €
+            - button "✕" [ref=e103]
+          - generic [ref=e104]:
+            - generic [ref=e105]: "Krabica a Podložka: Krabica a Podložka"
+            - generic [ref=e106]: 1.00 €
+            - button "✕" [ref=e107]
+        - generic [ref=e109]: 30.18 €
+      - button "+ ďalšia torta" [ref=e110] [cursor=pointer]
+      - button "📄 Exportovať do PDF" [ref=e111] [cursor=pointer]
+    - button "Záväzne objednať • 30.18 €" [ref=e113] [cursor=pointer]
+```

@@ -1,6 +1,10 @@
 // Email sending function for Supabase Edge Runtime
+import { createClient } from "@supabase/supabase-js";
+
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
-const ADMIN_EMAIL = "janspano01@gmail.com"; // Zmeň na tvoj admin email
+const ADMIN_EMAIL = "janspano01@gmail.com"; // fallback email
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -21,6 +25,7 @@ interface OrderPayload {
   total: number;
   pdfBase64?: string | null;
   pdfFilename?: string | null;
+  bakeryId?: string | null;
 }
 
 Deno.serve(async (req: Request) => {
@@ -30,10 +35,32 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { customerEmail, customerName, items, total, pdfBase64, pdfFilename }: OrderPayload = await req.json();
+    const { customerEmail, customerName, items, total, pdfBase64, pdfFilename, bakeryId }: OrderPayload = await req.json();
 
     if (!RESEND_API_KEY) {
       throw new Error("RESEND_API_KEY is not set");
+    }
+
+    // Resolve bakery owner's email using service role client
+    let adminEmail = ADMIN_EMAIL;
+    if (bakeryId) {
+      try {
+        const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+          auth: { autoRefreshToken: false, persistSession: false },
+        });
+        const { data: members } = await supabaseAdmin
+          .from("bakery_members")
+          .select("user_id")
+          .eq("bakery_id", bakeryId)
+          .limit(1)
+          .single();
+        if (members?.user_id) {
+          const { data: { user } } = await supabaseAdmin.auth.admin.getUserById(members.user_id);
+          if (user?.email) adminEmail = user.email;
+        }
+      } catch (_err) {
+        // keep fallback
+      }
     }
 
     // Vytvor HTML obsah pre email
@@ -87,7 +114,7 @@ Deno.serve(async (req: Request) => {
       },
       body: JSON.stringify({
         from: "Objednávky <onboarding@resend.dev>",
-        to: [ADMIN_EMAIL],
+        to: [adminEmail],
         subject: `Nová objednávka od ${customerName}`,
         html: emailHtml,
         attachments: attachments.length ? attachments : undefined,

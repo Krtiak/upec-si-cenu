@@ -26,7 +26,32 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   // Načítaj tému pri štarte — pre slug z URL (homepage) alebo z auth session (admin)
   useEffect(() => {
     async function loadTheme() {
-      // 1. Skús načítať podľa prihláseného usera (admin)
+      const slug = window.location.pathname.split('/').filter(Boolean)[0];
+      const reservedSlugs = ['admin', 'login', 'register', 'dashboard', 'podmienky'];
+
+      // 1. Ak sme na verejnej stránke pekárne (slug v URL), načítaj tému podľa slugu
+      if (slug && !reservedSlugs.includes(slug)) {
+        const { data: bakery } = await supabase
+          .from('bakeries')
+          .select('id')
+          .eq('slug', slug)
+          .maybeSingle();
+        if (bakery?.id) {
+          const { data } = await supabase
+            .from('app_settings')
+            .select('value')
+            .eq('bakery_id', bakery.id)
+            .eq('key', 'theme')
+            .maybeSingle();
+          if (data?.value) {
+            applyTheme(data.value as ThemeId);
+            setThemeId(data.value as ThemeId);
+          }
+          return;
+        }
+      }
+
+      // 2. Fallback pre admin stránky: načítaj podľa prihláseného usera
       const { data: { session } } = await supabase.auth.getSession();
       if (session?.user) {
         const { data: member } = await supabase
@@ -39,30 +64,6 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
             .from('app_settings')
             .select('value')
             .eq('bakery_id', member.bakery_id)
-            .eq('key', 'theme')
-            .maybeSingle();
-          if (data?.value) {
-            applyTheme(data.value as ThemeId);
-            setThemeId(data.value as ThemeId);
-            return;
-          }
-        }
-      }
-
-      // 2. Fallback: načítaj podľa slug z URL (verejná homepage)
-      const slug = window.location.pathname.split('/').filter(Boolean)[0];
-      const reservedSlugs = ['admin', 'login', 'register', 'dashboard'];
-      if (slug && !reservedSlugs.includes(slug)) {
-        const { data: bakery } = await supabase
-          .from('bakeries')
-          .select('id')
-          .eq('slug', slug)
-          .maybeSingle();
-        if (bakery?.id) {
-          const { data } = await supabase
-            .from('app_settings')
-            .select('value')
-            .eq('bakery_id', bakery.id)
             .eq('key', 'theme')
             .maybeSingle();
           if (data?.value) {

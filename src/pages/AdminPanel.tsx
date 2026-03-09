@@ -4163,7 +4163,7 @@ export function AdminPanel() {
                 {themeEditMode ? (
                   <div style={{ display: 'flex', gap: '0.5rem' }}>
                     <button
-                      onClick={async () => { await setTheme(pendingThemeId); setThemeEditMode(false); }}
+                      onClick={async () => { await setTheme(pendingThemeId, userBakeryId ?? undefined); setThemeEditMode(false); }}
                       style={{ padding: '0.4rem 1rem', background: '#7c3aed', color: '#fff', border: 'none', borderRadius: '8px', fontSize: '0.85rem', fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}
                     >
                       💾 Uložiť

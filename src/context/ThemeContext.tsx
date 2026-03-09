@@ -23,13 +23,13 @@ function applyTheme(id: ThemeId) {
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [themeId, setThemeId] = useState<ThemeId>('pink');
 
-  // Načítaj tému pri štarte — pre slug z URL (homepage) alebo z auth session (admin)
+  // Načítaj tému pri štarte — podľa slug v URL (verejná stránka) alebo prihláseného admina
   useEffect(() => {
     async function loadTheme() {
       const slug = window.location.pathname.split('/').filter(Boolean)[0];
       const reservedSlugs = ['admin', 'login', 'register', 'dashboard', 'podmienky'];
 
-      // 1. Ak sme na verejnej stránke pekárne (slug v URL), načítaj tému podľa slugu
+      // 1. Verejná stránka pekárne — slug v URL
       if (slug && !reservedSlugs.includes(slug)) {
         const { data: bakery } = await supabase
           .from('bakeries')
@@ -47,11 +47,11 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
             applyTheme(data.value as ThemeId);
             setThemeId(data.value as ThemeId);
           }
-          return;
         }
+        return;
       }
 
-      // 2. Fallback pre admin stránky: načítaj podľa prihláseného usera
+      // 2. Admin stránka — čítaj tému podľa prihláseného usera
       const { data: { session } } = await supabase.auth.getSession();
       if (session?.user) {
         const { data: member } = await supabase
@@ -80,7 +80,6 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     applyTheme(id);
     setThemeId(id);
 
-    // Zisti bakery_id ak nebol poskytnutý
     let resolvedBakeryId = bakeryId;
     if (!resolvedBakeryId) {
       const { data: { session } } = await supabase.auth.getSession();
@@ -95,9 +94,10 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (resolvedBakeryId) {
-      await supabase
+      const { error } = await supabase
         .from('app_settings')
         .upsert({ bakery_id: resolvedBakeryId, key: 'theme', value: id }, { onConflict: 'bakery_id,key' });
+      if (error) console.error('setTheme save failed:', error.message);
     }
   }
 

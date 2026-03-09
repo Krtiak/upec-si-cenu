@@ -94,18 +94,9 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (resolvedBakeryId) {
-      // Try UPDATE first; if no row exists yet, INSERT
-      const { error: updateErr, count } = await supabase
+      await supabase
         .from('app_settings')
-        .update({ value: id })
-        .eq('bakery_id', resolvedBakeryId)
-        .eq('key', 'theme');
-      if (!updateErr && count === 0) {
-        // Row didn't exist yet — insert it
-        await supabase
-          .from('app_settings')
-          .insert({ bakery_id: resolvedBakeryId, key: 'theme', value: id });
-      }
+        .upsert({ bakery_id: resolvedBakeryId, key: 'theme', value: id }, { onConflict: 'bakery_id,key' });
     }
   }
 

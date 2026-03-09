@@ -97,6 +97,8 @@ export function LandingPage() {
   const [regError, setRegError] = useState('');
   const [regSuccess, setRegSuccess] = useState(false);
   const [regCreatedSlug, setRegCreatedSlug] = useState('');
+  const [regTermsAccepted, setRegTermsAccepted] = useState(false);
+  const [regTermsError, setRegTermsError] = useState(false);
 
   const slugify = (s: string) =>
     s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
@@ -122,12 +124,20 @@ export function LandingPage() {
     setShowPwdConfirm(false);
     setRegError('');
     setRegSuccess(false);
+    setRegTermsAccepted(false);
+    setRegTermsError(false);
     setShowRegModal(true);
   };
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setRegError('');
+
+    if (!regTermsAccepted) {
+      setRegTermsError(true);
+      return;
+    }
+    setRegTermsError(false);
 
     if (regPassword !== regPasswordConfirm) {
       setRegError('Heslá sa nezhodujú.');
@@ -419,6 +429,10 @@ export function LandingPage() {
               <button onClick={() => scrollTo('faq')}>FAQ</button>
             </div>
             <div>
+              <h4>Právne</h4>
+              <a href="/podmienky" target="_blank" rel="noopener noreferrer">Obchodné podmienky</a>
+            </div>
+            <div>
               <h4>Kontakt</h4>
               <a href="mailto:janspano01@gmail.com">janspano01@gmail.com</a>
             </div>
@@ -431,7 +445,7 @@ export function LandingPage() {
 
       {/* ─── REGISTRATION MODAL ─── */}
       {showRegModal && (
-        <div className="landing-modal-overlay" onClick={() => !regLoading && setShowRegModal(false)}>
+        <div className="landing-modal-overlay">
           <div className="landing-modal" onClick={e => e.stopPropagation()}>
             <button className="landing-modal__close" onClick={() => setShowRegModal(false)}>✕</button>
             {regSuccess ? (
@@ -550,6 +564,18 @@ export function LandingPage() {
                       <span className="landing-modal__field-error">Heslá sa nezhodujú</span>
                     )}
                   </label>
+                  <div className={`landing-modal__tc${regTermsError ? ' landing-modal__tc--error' : ''}`}>
+                    <input
+                      type="checkbox"
+                      id="reg-terms"
+                      checked={regTermsAccepted}
+                      onChange={e => { setRegTermsAccepted(e.target.checked); if (e.target.checked) setRegTermsError(false); }}
+                    />
+                    <label htmlFor="reg-terms" className="landing-modal__tc-label">
+                      Súhlasím s <a href="/podmienky" target="_blank" rel="noopener noreferrer" className="landing-modal__tc-link">Obchodnými podmienkami</a>
+                    </label>
+                  </div>
+                  {regTermsError && <span className="landing-modal__field-error" style={{ marginTop: '-4px' }}>Musíte súhlasiť s obchodnými podmienkami.</span>}
                   <button type="submit" className="landing-btn--primary" disabled={regLoading}>
                     {regLoading ? 'Registrujem…' : 'Zaregistrovať sa'}
                   </button>

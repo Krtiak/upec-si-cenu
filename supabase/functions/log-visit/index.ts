@@ -28,7 +28,7 @@ async function getLocationFromIP(ip: string): Promise<{ city?: string; country?:
       return null;
     }
     
-    const response = await fetch(`http://ip-api.com/json/${ip}?fields=city,country`, {
+    const response = await fetch(`https://ip-api.com/json/${encodeURIComponent(ip)}?fields=city,country`, {
       method: 'GET',
     });
     
@@ -66,13 +66,13 @@ Deno.serve(async (req: Request) => {
     // Get geolocation data
     const location = await getLocationFromIP(ip);
 
-    // Optional anonymization: hash IP instead of storing raw
-    // const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ip));
-    // const ipHash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    // Anonymize IP with SHA-256 (GDPR — raw IPs are personal data)
+    const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ip));
+    const ipHash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 
     const { error } = await supabase.from('page_visits').insert({
       path: visitPath,
-      ip, // replace with ipHash if anonymizing
+      ip: ipHash,
       user_agent: userAgent,
       city: location?.city || null,
       country: location?.country || null,

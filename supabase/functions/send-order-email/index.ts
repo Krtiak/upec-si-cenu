@@ -28,6 +28,24 @@ interface OrderPayload {
   bakeryId?: string | null;
 }
 
+// Escape HTML special chars to prevent XSS/HTML injection in email body
+function escapeHtml(str: string): string {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
+// Sanitize filename: strip path separators and non-safe characters
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^a-zA-Z0-9._\- ]/g, '').slice(0, 100) || 'attachment.pdf';
+}
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_PDF_BYTES = 8 * 1024 * 1024; // 8 MB base64 limit
+
 Deno.serve(async (req: Request) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
@@ -35,10 +53,38 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { customerEmail, customerName, items, total, pdfBase64, pdfFilename, bakeryId }: OrderPayload = await req.json();
+    const body = await req.json();
+    const { customerEmail, customerName, items, total, pdfBase64, pdfFilename, bakeryId }: OrderPayload = body;
 
     if (!RESEND_API_KEY) {
       throw new Error("RESEND_API_KEY is not set");
+    }
+
+    // --- Input validation ---
+    if (!EMAIL_REGEX.test(customerEmail ?? '')) {
+      return new Response(JSON.stringify({ success: false, error: 'Invalid customer email' }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 400,
+      });
+    }
+    if (typeof customerName !== 'string' || customerName.trim().length === 0 || customerName.length > 200) {
+      return new Response(JSON.stringify({ success: false, error: 'Invalid customer name' }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 400,
+      });
+    }
+    if (!Array.isArray(items) || items.length === 0 || items.length > 200) {
+      return new Response(JSON.stringify({ success: false, error: 'Invalid items' }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 400,
+      });
+    }
+    if (typeof total !== 'number' || !isFinite(total) || total < 0) {
+      return new Response(JSON.stringify({ success: false, error: 'Invalid total' }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 400,
+      });
+    }
+    if (pdfBase64 && pdfBase64.length > MAX_PDF_BYTES) {
+      return new Response(JSON.stringify({ success: false, error: 'PDF too large' }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 400,
+      });
     }
 
     // Resolve bakery owner's email using service role client
@@ -63,15 +109,15 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // Vytvor HTML obsah pre email
+    // Vytvor HTML obsah pre email — všetky user inputs sú escapované (XSS prevencia)
     const itemsHtml = items
       .map(
         (item) =>
           `<tr>
-            <td style="padding: 8px; border: 1px solid #ddd;">${item.name}</td>
-            <td style="padding: 8px; border: 1px solid #ddd; text-align: center;">${item.qty}x</td>
-            <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">${item.unitPrice.toFixed(2)} €</td>
-            <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">${item.lineTotal.toFixed(2)} €</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(String(item.name))}</td>
+            <td style="padding: 8px; border: 1px solid #ddd; text-align: center;">${escapeHtml(String(item.qty))}x</td>
+            <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">${Number(item.unitPrice).toFixed(2)} €</td>
+            <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">${Number(item.lineTotal).toFixed(2)} €</td>
           </tr>`
       )
       .join("");
@@ -79,8 +125,8 @@ Deno.serve(async (req: Request) => {
     const emailHtml = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>Nová objednávka</h2>
-        <p><strong>Meno:</strong> ${customerName}</p>
-        <p><strong>Email:</strong> ${customerEmail}</p>
+        <p><strong>Meno:</strong> ${escapeHtml(customerName)}</p>
+        <p><strong>Email:</strong> ${escapeHtml(customerEmail)}</p>
         <h3>Položky objednávky:</h3>
         <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
           <thead>
@@ -102,7 +148,7 @@ Deno.serve(async (req: Request) => {
     // Prepare optional attachment (Resend API format: filename + content)
     const attachments = [] as Array<{ filename: string; content: string }>;
     if (pdfBase64 && pdfFilename) {
-      attachments.push({ filename: pdfFilename, content: pdfBase64 });
+      attachments.push({ filename: sanitizeFilename(pdfFilename), content: pdfBase64 });
     }
 
     // Poslať email adminovi (promise, nech beží paralelne)

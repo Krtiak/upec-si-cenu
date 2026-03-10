@@ -1,8 +1,10 @@
-// Email sending function for Supabase Edge Runtime
+// Email sending function for Supabase Edge Runtime — using Brevo (formerly Sendinblue)
 import { createClient } from "@supabase/supabase-js";
 
-const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
+const BREVO_API_KEY = Deno.env.get("BREVO_API_KEY");
 const ADMIN_EMAIL = "janspano01@gmail.com"; // fallback email
+const SENDER_EMAIL = "janspano01@gmail.com"; // overený sender v Brevo
+const SENDER_NAME = "Upec si cenu";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
@@ -28,7 +30,6 @@ interface OrderPayload {
   bakeryId?: string | null;
 }
 
-// Escape HTML special chars to prevent XSS/HTML injection in email body
 function escapeHtml(str: string): string {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -38,16 +39,45 @@ function escapeHtml(str: string): string {
     .replace(/'/g, '&#x27;');
 }
 
-// Sanitize filename: strip path separators and non-safe characters
 function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9._\- ]/g, '').slice(0, 100) || 'attachment.pdf';
 }
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MAX_PDF_BYTES = 8 * 1024 * 1024; // 8 MB base64 limit
+const MAX_PDF_BYTES = 8 * 1024 * 1024;
+
+async function sendBrevoEmail(opts: {
+  to: string;
+  toName: string;
+  subject: string;
+  html: string;
+  attachment?: { name: string; content: string } | null;
+}) {
+  const body: Record<string, unknown> = {
+    sender: { name: SENDER_NAME, email: SENDER_EMAIL },
+    to: [{ email: opts.to, name: opts.toName }],
+    subject: opts.subject,
+    htmlContent: opts.html,
+  };
+  if (opts.attachment) {
+    body.attachment = [{ name: opts.attachment.name, content: opts.attachment.content }];
+  }
+  const resp = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-key": BREVO_API_KEY!,
+    },
+    body: JSON.stringify(body),
+  });
+  const json = await resp.json();
+  if (!resp.ok) {
+    throw new Error(json?.message || `Brevo error: ${resp.status}`);
+  }
+  return json;
+}
 
 Deno.serve(async (req: Request) => {
-  // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
@@ -56,11 +86,10 @@ Deno.serve(async (req: Request) => {
     const body = await req.json();
     const { customerEmail, customerName, items, total, pdfBase64, pdfFilename, bakeryId }: OrderPayload = body;
 
-    if (!RESEND_API_KEY) {
-      throw new Error("RESEND_API_KEY is not set");
+    if (!BREVO_API_KEY) {
+      throw new Error("BREVO_API_KEY is not set");
     }
 
-    // --- Input validation ---
     if (!EMAIL_REGEX.test(customerEmail ?? '')) {
       return new Response(JSON.stringify({ success: false, error: 'Invalid customer email' }), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 400,
@@ -87,8 +116,8 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // Resolve bakery owner's email using service role client
-    let adminEmail = ADMIN_EMAIL;
+    let bakeryEmail = ADMIN_EMAIL;
+    let bakeryName = "Cukraren";
     if (bakeryId) {
       try {
         const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -102,124 +131,85 @@ Deno.serve(async (req: Request) => {
           .single();
         if (members?.user_id) {
           const { data: { user } } = await supabaseAdmin.auth.admin.getUserById(members.user_id);
-          if (user?.email) adminEmail = user.email;
+          if (user?.email) bakeryEmail = user.email;
         }
+        const { data: bak } = await supabaseAdmin
+          .from("bakeries")
+          .select("name")
+          .eq("id", bakeryId)
+          .single();
+        if (bak?.name) bakeryName = bak.name;
       } catch (_err) {
         // keep fallback
       }
     }
 
-    // Vytvor HTML obsah pre email — všetky user inputs sú escapované (XSS prevencia)
     const itemsHtml = items
-      .map(
-        (item) =>
-          `<tr>
-            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(String(item.name))}</td>
-            <td style="padding: 8px; border: 1px solid #ddd; text-align: center;">${escapeHtml(String(item.qty))}x</td>
-            <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">${Number(item.unitPrice).toFixed(2)} €</td>
-            <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">${Number(item.lineTotal).toFixed(2)} €</td>
-          </tr>`
+      .map((item) =>
+        `<tr>
+          <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(String(item.name))}</td>
+          <td style="padding: 8px; border: 1px solid #ddd; text-align: center;">${escapeHtml(String(item.qty))}x</td>
+          <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">${Number(item.unitPrice).toFixed(2)} EUR</td>
+          <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">${Number(item.lineTotal).toFixed(2)} EUR</td>
+        </tr>`
       )
       .join("");
 
-    const emailHtml = `
+    const orderTable = `
+      <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+        <thead>
+          <tr style="background-color: #f5f5f5;">
+            <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Polozka</th>
+            <th style="padding: 8px; border: 1px solid #ddd;">Pocet</th>
+            <th style="padding: 8px; border: 1px solid #ddd;">Cena/ks</th>
+            <th style="padding: 8px; border: 1px solid #ddd;">Spolu</th>
+          </tr>
+        </thead>
+        <tbody>${itemsHtml}</tbody>
+      </table>
+      <p style="font-size: 18px; font-weight: bold; text-align: right;">Celkova suma: ${total.toFixed(2)} EUR</p>
+    `;
+
+    const bakeryHtml = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <h2>Nová objednávka</h2>
+        <h2>Nova objednavka od ${escapeHtml(customerName)}</h2>
         <p><strong>Meno:</strong> ${escapeHtml(customerName)}</p>
-        <p><strong>Email:</strong> ${escapeHtml(customerEmail)}</p>
-        <h3>Položky objednávky:</h3>
-        <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-          <thead>
-            <tr style="background-color: #f5f5f5;">
-              <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Položka</th>
-              <th style="padding: 8px; border: 1px solid #ddd;">Počet</th>
-              <th style="padding: 8px; border: 1px solid #ddd;">Cena/ks</th>
-              <th style="padding: 8px; border: 1px solid #ddd;">Spolu</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${itemsHtml}
-          </tbody>
-        </table>
-        <p style="font-size: 18px; font-weight: bold; text-align: right;">Celková suma: ${total.toFixed(2)} €</p>
+        <p><strong>Email zakaznika:</strong> ${escapeHtml(customerEmail)}</p>
+        <h3>Polozky objednavky:</h3>
+        ${orderTable}
       </div>
     `;
 
-    // Prepare optional attachment (Resend API format: filename + content)
-    const attachments = [] as Array<{ filename: string; content: string }>;
-    if (pdfBase64 && pdfFilename) {
-      attachments.push({ filename: sanitizeFilename(pdfFilename), content: pdfBase64 });
+    const customerHtml = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2>Dakujeme za objednavku!</h2>
+        <p>Dobry den ${escapeHtml(customerName)},</p>
+        <p>Vasa objednavka v <strong>${escapeHtml(bakeryName)}</strong> bola uspesne prijata. Coskoro Vas budeme kontaktovat.</p>
+        <h3>Vasa objednavka:</h3>
+        ${orderTable}
+        <p>S pozdravom,<br>${escapeHtml(bakeryName)}</p>
+      </div>
+    `;
+
+    const attachment = pdfBase64 && pdfFilename
+      ? { name: sanitizeFilename(pdfFilename), content: pdfBase64 }
+      : null;
+
+    const [bakeryResult, customerResult] = await Promise.allSettled([
+      sendBrevoEmail({ to: bakeryEmail, toName: bakeryName, subject: `Nova objednavka od ${customerName}`, html: bakeryHtml, attachment }),
+      sendBrevoEmail({ to: customerEmail, toName: customerName, subject: `Potvrdenie objednavky - ${bakeryName}`, html: customerHtml, attachment }),
+    ]);
+
+    if (bakeryResult.status === 'rejected') {
+      throw new Error(`Bakery email failed: ${bakeryResult.reason}`);
     }
 
-    // Poslať email adminovi (promise, nech beží paralelne)
-    const adminEmailResponse = fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${RESEND_API_KEY}`,
-      },
-      body: JSON.stringify({
-        from: "Objednávky <onboarding@resend.dev>",
-        to: [adminEmail],
-        subject: `Nová objednávka od ${customerName}`,
-        html: emailHtml,
-        attachments: attachments.length ? attachments : undefined,
-      }),
-    });
-
-    // Pošli admin aj customer email paralelne; admin chyba je blokujúca, customer je "best effort"
-    const adminPromise = (async () => {
-      const resp = await adminEmailResponse;
-      const body = await resp.json();
-      if (!resp.ok || body?.error) {
-        throw new Error(body?.error || `Admin email failed with status: ${resp.status}`);
-      }
-      return body;
-    })();
-
-    const customerPromise = (async () => {
-      try {
-        const resp = await fetch("https://api.resend.com/emails", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${RESEND_API_KEY}`,
-          },
-          body: JSON.stringify({
-            from: "Torty <onboarding@resend.dev>",
-            to: [customerEmail],
-            subject: "Potvrdenie objednávky",
-            html: `
-              <div style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;\">
-                <h2>Ďakujeme za objednávku!</h2>
-                <p>Dobrý deň ${customerName},</p>
-                <p>Vaša objednávka bola úspešne prijatá. Čoskoro Vás budeme kontaktovať.</p>
-                ${emailHtml}
-                <p>S pozdravom,<br>Váš tím</p>
-              </div>
-            `,
-            attachments: attachments.length ? attachments : undefined,
-          }),
-        });
-        const body = await resp.json();
-        if (!resp.ok || body?.error) {
-          throw new Error(body?.error || `Customer email failed with status: ${resp.status}`);
-        }
-        return body;
-      } catch (err) {
-        return err instanceof Error ? err : new Error(String(err));
-      }
-    })();
-
-    const [adminResult, customerResult] = await Promise.all([adminPromise, customerPromise]);
-    const customerError = customerResult instanceof Error ? customerResult.message : null;
+    const customerError = customerResult.status === 'rejected' ? String(customerResult.reason) : null;
 
     return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message: customerError ? "Admin email sent; customer email may have failed" : "Emails sent successfully",
-        adminId: adminResult.id,
-        customerId: customerResult instanceof Error ? null : customerResult?.id || null,
+      JSON.stringify({
+        success: true,
+        message: customerError ? "Bakery email sent; customer email may have failed" : "Emails sent successfully",
         customerError,
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 200 }
